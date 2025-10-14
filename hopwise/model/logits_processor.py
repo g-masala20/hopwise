@@ -12,9 +12,10 @@ import inspect
 import numpy as np
 import torch
 from cachetools import LFUCache
-
+import math
 from hopwise.utils import KnowledgeEvaluationType
-
+import random
+from hopwise.utils import PathLanguageModelingTokenType
 
 class LogitsProcessor:
     """
@@ -222,6 +223,622 @@ class ConstrainedLogitsProcessorWordLevel(LogitsProcessor):
             banned_mask[candidate_tokens] = False
             self.mask_cache[key] = banned_mask
         return banned_mask
+
+
+
+class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLevel):
+    
+    """
+    Force the last token to be one of the force_tokens if the total length is reached, in the path generation stage
+    this means to limit the hop size. This is a word-level constraint, does not work with piece tokenizers.
+    If task is link prediction (LP) logit processor forces last token to reachable ones
+    """
+
+    RECOMMENDATION_TASK = "recommendation"
+    LINK_PREDICTION_TASK = "link_prediction"
+
+    def __init__(
+        self,
+        tokenized_kg,
+        tokenized_ignored_ids,
+        max_sequence_length,
+        tokenizer,
+        num_return_sequences,
+        train_data,  # aggiunta mia 
+        mask_cache_size=3 * 10**4,
+        pos_candidates_cache_size=1 * 10**5,
+        task="recommendation",
+        **kwargs,
+    ):
+        super().__init__(
+        tokenized_kg,
+        tokenized_ignored_ids,
+        max_sequence_length,
+        tokenizer,
+        num_return_sequences,
+        mask_cache_size,
+        pos_candidates_cache_size,
+        task,
+        **kwargs)
+        self.train_data = train_data  # Salva train_data come attributo dell'istanza
+
+    def __call__(self, input_ids, scores):
+
+        #problemi del codice:
+        # sembra che la fullmask sia sempre piena, quindi il codice non va mai avanti
+        # va fatto il file di configurazione (restrictions_ml-100k.yaml) 
+        # e ho modificato direttamente il dataset ml-100k (probabilmente male)
+        
+        
+        # finire le modifiche all'applicazione delle restrizioni post-aggiornamento da casuale a file-definied
+        
+        train_data = self.train_data
+        entity_mapping = train_data.dataset.field2token_id['entity_id'] #todo passa solo questo
+
+
+        #breakpoint()
+        current_len = input_ids.shape[-1]
+        has_bos_token = self.is_bos_token_in_input(input_ids)
+
+        if has_bos_token and current_len == self.max_sequence_length - 1:
+            self.mask_non_eos_tokens(scores)
+        else:
+            unique_input_ids = input_ids
+            if self.task == self.RECOMMENDATION_TASK and current_len < self.max_sequence_length - 1 - has_bos_token:
+                user_idx = 1
+                
+                _, input_ids_indices, input_ids_inv = np.unique(
+                    input_ids.cpu().numpy()[:, [user_idx]], axis=0, return_index=True, return_inverse=True
+                )
+                unique_input_ids = input_ids[input_ids_indices]
+
+            # ---
+
+            #all_entity_keys = list(entity_mapping.keys())
+
+            # Estrai i constraint dal dataset (con fallback se non esiste)
+            try:
+                constraints_tokens = train_data.dataset.field2id_token['constraints']
+                #print(f"DEBUG: constraints found! Length: {len(constraints_tokens)}")
+
+                # Solo se i constraints esistono, procedi con il sistema di restrizioni
+                hard_restriction_keys_per_user = []
+                soft_restriction_keys_per_user = []
+                
+                for idx in range(unique_input_ids.shape[0]):
+                    user_position = 1 if has_bos_token else 0
+                    user_idx_in_batch = unique_input_ids[idx, user_position].item()
+                    
+                    if user_idx_in_batch < len(constraints_tokens):
+                        user_constraints = constraints_tokens[user_idx_in_batch].split(',') if constraints_tokens[user_idx_in_batch] else []
+                        
+                        # Primi 2 constraint per hard restrictions
+                        hard_constraints = user_constraints[:2] if len(user_constraints) >= 2 else []
+                        # Terzo e quarto constraint per soft restrictions  
+                        soft_constraints = user_constraints[2:4] if len(user_constraints) >= 4 else []
+                        
+                        hard_restriction_keys_per_user.append(hard_constraints)
+                        soft_restriction_keys_per_user.append(soft_constraints)
+                    else:
+                        # Fallback per utenti senza constraints
+                        hard_restriction_keys_per_user.append([])
+                        soft_restriction_keys_per_user.append([])
+                        
+                # maschera completa, contentente le maschere l'applicazione di tute le restrizioni
+                full_mask = np.zeros((unique_input_ids.shape[0], len(self.tokenizer)), dtype=bool)
+                
+            except KeyError:
+                # Se 'constraints' non esiste, salta tutto il sistema di constraints
+                constraints_tokens = None
+                hard_restriction_keys_per_user = [[] for _ in range(unique_input_ids.shape[0])]
+                soft_restriction_keys_per_user = [[] for _ in range(unique_input_ids.shape[0])]
+                full_mask = np.zeros((unique_input_ids.shape[0], len(self.tokenizer)), dtype=bool) # Inizializza maschera vuota che non blocca nulla
+
+            # ---
+
+            for idx in range(unique_input_ids.shape[0]):
+                if self.task == self.RECOMMENDATION_TASK:
+                    key, candidate_tokens = self.process_scores_rec(unique_input_ids, idx)
+                elif self.task == self.LINK_PREDICTION_TASK:
+                    key, candidate_tokens = self.process_scores_lp(unique_input_ids, idx)
+                
+                # HARD MASKING:
+
+                # Inizializza la maschera base una sola volta
+                banned_mask = self.get_banned_mask(key, candidate_tokens)
+                full_mask[idx] = banned_mask.copy()
+                
+                # DEBUG: Controlla se già mascherato dalla logica base
+                if np.all(full_mask[idx]):
+                    print(f"DEBUG: Base mask already blocks all tokens for idx={idx} (BEFORE constraints)")
+                
+                # Applica hard restrictions solo se i constraints esistono
+                if constraints_tokens is not None:
+                    hard_restriction_mask = np.zeros(len(self.tokenizer), dtype=bool)
+                    break
+                    
+                    # Accumula tutte le restrizioni hard per questo utente
+                    for x_val in hard_restriction_keys_per_user[idx]:
+                        constraint_mask = self.gen_banmask_from_key(x_val, train_data)
+                        hard_restriction_mask = np.logical_or(hard_restriction_mask, constraint_mask)
+
+                        if np.all(full_mask[idx]): 
+                            print(f"DEBUG: All tokens masked for idx={idx} (AFTER constraints) (dentro il ciclo)")
+                            raise RuntimeError("All tokens are masked for all input rows in full_mask.(dentro il ciclo)")
+
+                    
+                    # Combina maschera base con restrizioni hard
+                    full_mask[idx] = np.logical_or(banned_mask, hard_restriction_mask)
+
+                if np.all(banned_mask): #np.all(full_mask[idx]): 
+                    print(f"DEBUG: All tokens masked for idx={idx} (AFTER constraints)")
+                    raise RuntimeError("All tokens are masked for all input rows in full_mask.(BANANAAAAAA)")
+
+                #--- 
+
+                #SOFT MASKING:
+                # Applica soft masking solo se i constraints esistono
+                if constraints_tokens is not None:
+                    # sintesi: vengono ordinati i valori in modo decrescente in base al numero di token connessi,
+                    # viene applicata la maschera per volta, e si applica la successiva solo se il kg è valido,
+                    # altrimenti si interrompe il processo 
+                    
+                    # Solo ordinare se ci sono effettivamente constraint soft
+                    if soft_restriction_keys_per_user[idx]:
+                        soft_restriction_keys_per_user[idx] = sorted(
+                            soft_restriction_keys_per_user[idx],
+                            key=lambda k: len(self.tokenized_kg[entity_mapping[k]]) if k in entity_mapping and entity_mapping[k] in self.tokenized_kg else 0,
+                            reverse=True,
+                        )
+
+                    #soft_restriction_mask[idx] = self.get_banned_mask(key, candidate_tokens)
+
+                    for y_val in soft_restriction_keys_per_user[idx]:
+                        # Verifica che y_val esista nell'entity_mapping
+                        if y_val in entity_mapping:
+                            soft_mask = np.logical_or(full_mask[idx], self.gen_banmask_from_key(y_val, train_data))
+                            if np.all(soft_mask): 
+                                break
+                            else:
+                                full_mask[idx] = soft_mask
+
+            #---
+
+            if self.task == self.RECOMMENDATION_TASK and current_len < self.max_sequence_length - 1 - has_bos_token:
+                scores[full_mask[input_ids_inv]] = -math.inf
+            else:
+                scores[full_mask] = -math.inf
+
+        return scores
+    
+    def generate_and_save_constraints(self, user_file_path, n_constraints=6, output_file_path=None):
+        """
+        Aggiorna il file utente aggiungendo la colonna 'constraints',
+        per ogni utente genera n_constraints restrizioni casuali da entity_mapping.
+        Se output_file_path è None, sovrascrive user_file_path, altrimenti salva su output_file_path.
+        """
+        import random
+        
+        entity_mapping = self.train_data.dataset.field2token_id['entity_id']
+        all_entity_keys = list(entity_mapping.keys())
+
+        with open(user_file_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        header = lines[0].strip().split()
+        if "constraints" not in header:
+            header.append("constraints")
+
+        new_lines = [header]
+        for line in lines[1:]:
+            fields = line.strip().split()
+            constraints = ",".join(random.sample(all_entity_keys, n_constraints))
+            if len(fields) < len(header):
+                fields.append(constraints)
+            else:
+                fields[header.index("constraints")] = constraints
+            new_lines.append(fields)
+
+        output_path = output_file_path if output_file_path is not None else user_file_path
+        with open(output_path, "w", encoding="utf-8") as f:
+            for row in new_lines:
+                f.write("\t".join(row) + "\n")
+
+
+    def __call__WRONG(self, input_ids, scores):
+
+        #problemi del codice:
+        # tanti e sono tutti del programmatore :thumbs_up:
+
+        #hard_restriction_keys = ["m.0v1k9hr", "m.0zbg8vq", "m.0zdxbv0", "m.0znj_66"] 
+        #soft_restriction_keys = ["m.0zcbl", "m.0zhv", "m.0z4s", "m.0yzbg"]
+        #preferences_keys = ["m.0v1k9hr", "m.0zbg8vq", "m.0zdxbv0", "m.0znj_66"]
+        
+        train_data = self.train_data
+        entity_mapping = train_data.dataset.field2token_id['entity_id'] #todo passa solo questo
+
+        #breakpoint()
+        current_len = input_ids.shape[-1]
+        has_bos_token = self.is_bos_token_in_input(input_ids)
+
+        if has_bos_token and current_len == self.max_sequence_length - 1:
+            self.mask_non_eos_tokens(scores)
+        else:
+            unique_input_ids = input_ids
+            if self.task == self.RECOMMENDATION_TASK and current_len < self.max_sequence_length - 1 - has_bos_token:
+                user_idx = 1
+                #breakpoint()
+                _, input_ids_indices, input_ids_inv = np.unique(
+                    input_ids.cpu().numpy()[:, [user_idx]], axis=0, return_index=True, return_inverse=True
+                )
+                unique_input_ids = input_ids[input_ids_indices]
+
+            # ---
+            # estrazione delle chiavi per le restrizioni per utente 
+
+            all_entity_keys = list(entity_mapping.keys())
+
+            hard_restriction_keys_per_user = [
+                random.sample(all_entity_keys, 5) for _ in range(unique_input_ids.shape[0])
+            ]
+
+            soft_restriction_keys_per_user = [
+                random.sample(all_entity_keys, 5) for _ in range(unique_input_ids.shape[0])
+            ]
+
+            preferences_keys_per_user = [
+                random.sample(all_entity_keys, 5) for _ in range(unique_input_ids.shape[0])
+            ]
+           
+            with open("hr_vals.txt", "w") as f:
+                for sotto_lista in hard_restriction_keys_per_user:
+                    f.write(" ".join(map(str, sotto_lista)) + "\n")
+
+            # ---
+            breakpoint()
+            full_mask = [ np.zeros((unique_input_ids.shape[0], len(self.tokenizer)), dtype=bool) for _ in range(unique_input_ids.shape[0]) ]
+
+            for idx in range(unique_input_ids.shape[0]):
+
+                hard_restriction_mask = [ np.zeros(len(self.tokenizer), dtype=bool) for _ in range(unique_input_ids.shape[0]) ]
+                
+                if self.task == self.RECOMMENDATION_TASK:
+                    key, candidate_tokens = self.process_scores_rec(unique_input_ids, idx)
+                elif self.task == self.LINK_PREDICTION_TASK:
+                    key, candidate_tokens = self.process_scores_lp(unique_input_ids, idx)
+                
+                # HARD MASKING:
+                # Per ogni utente, usa la lista di hard_restriction_keys_per_user[idx]
+                
+                # Inizializza la maschera base una sola volta
+                banned_mask = self.get_banned_mask(key, candidate_tokens)
+                hard_restriction_mask = np.zeros(len(self.tokenizer), dtype=bool)
+                
+                # Accumula tutte le restrizioni hard per questo utente
+                for x_val in hard_restriction_keys_per_user[idx]:
+                    if x_val in candidate_tokens:
+                        constraint_mask = self.gen_banmask_from_key(x_val, train_data)
+                        hard_restriction_mask = np.logical_or(hard_restriction_mask, constraint_mask)
+                
+                # Combina maschera base con restrizioni hard
+                full_mask[idx] = np.logical_or(banned_mask, hard_restriction_mask)
+
+                if np.all(full_mask):
+                    raise RuntimeError("All tokens are masked for all input rows in full_mask.")
+
+                #--- 
+
+                #SOFT MASKING:
+                # sintesi: vengono ordinati i valori in modo decrescente in base al numero di token connessi,
+                # viene applicata la maschera per volta, e si applica la successiva solo se il kg è valido,
+                # altrimenti si interrompe il processo 
+                for i, sr_keys_user in enumerate(soft_restriction_keys_per_user[idx]):
+                    soft_restriction_keys_per_user[idx] = sorted(
+                        sr_keys_user,
+                        key=lambda k: len(self.tokenized_kg[entity_mapping[k]]) if entity_mapping[k] in self.tokenized_kg else 0,
+                        reverse=True,
+                    )
+
+                soft_restriction_mask = [ self.get_banned_mask(key, candidate_tokens) for _ in range(unique_input_ids.shape[0]) ]
+                tmp_mask = full_mask.copy() 
+                #breakpoint()
+                for i,sr_keys_user in enumerate(soft_restriction_keys_per_user[idx]):
+                    for y_val in sr_keys_user:
+                        if y_val in candidate_tokens:
+                            soft_restriction_mask[i] = np.logical_or(soft_restriction_mask[i], self.gen_banmask_from_key(y_val, train_data))
+                            tmp_mask[i][idx] = np.logical_or(tmp_mask[idx], soft_restriction_mask)
+                            
+                            if np.all(tmp_mask): 
+                                break
+                            else:
+                                full_mask[i][idx] = tmp_mask[idx]
+
+            #---
+
+            # if self.task == self.RECOMMENDATION_TASK and current_len < self.max_sequence_length - 1 - has_bos_token:
+            #     scores[full_mask[input_ids_inv]] = -math.inf
+            # else:
+            #     scores[full_mask] = -math.inf
+
+        return scores
+
+    def extract_connected_entities(self, token_id):
+        """
+        Estrae tutte le entità connesse al token_id, sotto forma di lista completamente appiattita.
+        """
+        connected_entities = set()
+        for entity_set in self.tokenized_kg[token_id].values():
+            connected_entities.update(entity_set if isinstance(entity_set, (list, set)) else [entity_set])
+        connected_entities = list(set(connected_entities))#.sorted()  # l'ordine è temporaneo, serve solo a render più leggibile l'output
+        
+        return connected_entities
+    
+    def gen_banmask_from_key(self, key, train_data, ban_connected_entities=False):
+
+        mask = np.zeros(len(self.tokenizer), dtype=bool)
+
+        id_interno = train_data.dataset.field2token_id['entity_id'][key] #todo: passo troppe cose, si può migliorare
+        if id_interno < train_data.dataset.item_num:
+            token = PathLanguageModelingTokenType.ITEM.value + str(id_interno)
+        else:
+            token = PathLanguageModelingTokenType.ENTITY.value + str(id_interno)
+
+        token_id = self.tokenizer.convert_tokens_to_ids(token)
+        mask[token_id] = True
+        print(f"DEBUG GEN_BANMASK: Key '{key}' -> banned main token (ID: {token_id})")
+
+        # Ban di tutte le entità connesse per ogni key (solo se abilitato)
+        if ban_connected_entities and token_id in self.tokenized_kg:
+            connected_entities = self.extract_connected_entities(token_id)
+            print(f"DEBUG GEN_BANMASK: Key '{key}' also bans {len(connected_entities)} connected entities")
+            mask[connected_entities] = True  # ban di tutte le entità connesse
+        elif not ban_connected_entities:
+            print(f"DEBUG GEN_BANMASK: Key '{key}' -> connected entities ban DISABLED")
+
+        return mask
+    
+    def __call__SINGLEUSER(self, input_ids, scores):
+
+        #problemi del codice:
+        # tanti e sono tutti del programmatore :thumbs_up:
+
+        hard_restriction_keys = ["m.0v1k9hr", "m.0zbg8vq", "m.0zdxbv0", "m.0znj_66"] 
+        soft_restriction_keys = ["m.0zcbl", "m.0zhv", "m.0z4s", "m.0yzbg"]
+        preferences_keys = ["m.0v1k9hr", "m.0zbg8vq", "m.0zdxbv0", "m.0znj_66"]
+        
+        train_data = self.train_data
+        entity_mapping = train_data.dataset.field2token_id['entity_id'] #todo passa solo questo
+
+        #breakpoint()
+        current_len = input_ids.shape[-1]
+        has_bos_token = self.is_bos_token_in_input(input_ids)
+
+        if has_bos_token and current_len == self.max_sequence_length - 1:
+            self.mask_non_eos_tokens(scores)
+        else:
+            unique_input_ids = input_ids
+            if self.task == self.RECOMMENDATION_TASK and current_len < self.max_sequence_length - 1 - has_bos_token:
+                user_idx = has_bos_token
+                #breakpoint()
+                _, input_ids_indices, input_ids_inv = np.unique(
+                    input_ids.cpu().numpy()[:, [user_idx]], axis=0, return_index=True, return_inverse=True
+                )
+                unique_input_ids = input_ids[input_ids_indices]
+
+
+
+            full_mask = np.zeros((unique_input_ids.shape[0], len(self.tokenizer)), dtype=bool) 
+
+            hard_restriction_mask = np.zeros(len(self.tokenizer), dtype=bool)
+            
+            for idx in range(unique_input_ids.shape[0]):
+                if self.task == self.RECOMMENDATION_TASK:
+                    key, candidate_tokens = self.process_scores_rec(unique_input_ids, idx)
+                elif self.task == self.LINK_PREDICTION_TASK:
+                    key, candidate_tokens = self.process_scores_lp(unique_input_ids, idx)
+
+                # HARD MASKING:
+                # sintesi: 
+                # vengono applicate tutte le maschere, se il kg è valido allora andiamo avanti, 
+                # altrimenti il processo non può continuare e viene lanciato un errore
+                for x_val in hard_restriction_keys:
+                    if x_val in candidate_tokens:
+                        hard_restriction_mask = np.logical_or(hard_restriction_mask, self.gen_banmask_from_key(x_val, train_data))
+                                
+                banned_mask = self.get_banned_mask(key, candidate_tokens)
+                full_mask[idx] = np.logical_or(banned_mask, hard_restriction_mask) 
+
+                if np.all(full_mask):
+                    raise RuntimeError("All tokens are masked for all input rows in full_mask.")
+
+                #--- 
+
+                #SOFT MASKING:
+                # sintesi: vengono ordinati i valori in modo decrescente in base al numero di token connessi,
+                # viene applicata la maschera per volta, e si applica la successiva solo se il kg è valido,
+                # altrimenti si interrompe il processo 
+                soft_restriction_keys = sorted(
+                    soft_restriction_keys,
+                    key=lambda k: len(self.tokenized_kg[entity_mapping[k]]) if entity_mapping[k] in self.tokenized_kg else 0,
+                    reverse=True,
+                )
+
+                soft_restriction_mask = self.get_banned_mask(key, candidate_tokens)
+                tmp_mask = full_mask.copy() 
+                #breakpoint()
+                for y_val in soft_restriction_keys:
+                    if y_val in candidate_tokens:
+                        soft_restriction_mask = np.logical_or(soft_restriction_mask, self.gen_banmask_from_key(y_val, train_data))
+                        tmp_mask[idx] = np.logical_or(tmp_mask[idx], soft_restriction_mask)
+                        
+                        if np.all(tmp_mask): 
+                            break
+                        else:
+                            full_mask[idx] = tmp_mask[idx]
+
+            #---
+
+            if self.task == self.RECOMMENDATION_TASK and current_len < self.max_sequence_length - 1 - has_bos_token:
+                scores[full_mask[input_ids_inv]] = -math.inf
+            else:
+                scores[full_mask] = -math.inf
+
+        return scores
+                                
+    def __call__MULTIPLO(self, input_ids, scores):
+
+        x = ["m.0v1k9hr", "m.0zbg8vq", "m.0zdxbv0", "m.0znj_66"] # ora x può essere una lista di valori da escludere
+        train_data = self.train_data
+        entity_mapping = train_data.dataset.field2token_id['entity_id']
+
+        #breakpoint()
+        current_len = input_ids.shape[-1]
+        has_bos_token = self.is_bos_token_in_input(input_ids)
+
+        if has_bos_token and current_len == self.max_sequence_length - 1:
+            self.mask_non_eos_tokens(scores)
+        else:
+            unique_input_ids = input_ids
+            if self.task == self.RECOMMENDATION_TASK and current_len < self.max_sequence_length - 1 - has_bos_token:
+                last_n_tokens = 2 if self.is_next_token_entity(input_ids) else 1
+                _, input_ids_indices, input_ids_inv = np.unique(
+                    input_ids.cpu().numpy()[:, -last_n_tokens:], axis=0, return_index=True, return_inverse=True
+                )
+                unique_input_ids = input_ids[input_ids_indices]
+
+            full_mask = np.zeros((unique_input_ids.shape[0], len(self.tokenizer)), dtype=bool)
+
+            for idx in range(unique_input_ids.shape[0]):
+
+                hard_restriction_mask = np.zeros(len(self.tokenizer), dtype=bool)
+
+                if self.task == self.RECOMMENDATION_TASK:
+                    key, candidate_tokens = self.process_scores_rec(unique_input_ids, idx)
+
+                    for x_val in x:
+
+                        if x_val in candidate_tokens:
+                            id_interno_x = entity_mapping[x_val]
+                            if id_interno_x < train_data.dataset.item_num:
+                                token = PathLanguageModelingTokenType.ITEM.value + str(id_interno_x)
+                            else:
+                                token = PathLanguageModelingTokenType.ENTITY.value + str(id_interno_x)
+
+                            token_id = self.tokenizer.convert_tokens_to_ids(token)
+                            hard_restriction_mask[token_id] = True
+
+                            # Ban di tutte le entità connesse ad x_val
+                            if id_interno_x in self.tokenized_kg:
+                                connected_entities = self.tokenized_kg[id_interno_x].keys()
+                                for connected_entity in connected_entities:
+                                    connected_token = PathLanguageModelingTokenType.ENTITY.value + str(connected_entity)
+                                    connected_token_id = self.tokenizer.convert_tokens_to_ids(connected_token)
+                                    hard_restriction_mask[connected_token_id] = True
+
+                elif self.task == self.LINK_PREDICTION_TASK:
+                    key, candidate_tokens = self.process_scores_lp(unique_input_ids, idx)
+
+                banned_mask = self.get_banned_mask(key, candidate_tokens)
+                full_mask[idx] = np.logical_or(banned_mask, hard_restriction_mask) # si può migliorare?
+
+                if np.all(full_mask): # probabilmente molto lento
+                    raise RuntimeError("All tokens are masked for all input rows in full_mask.")
+
+            if self.task == self.RECOMMENDATION_TASK and current_len < self.max_sequence_length - 1 - has_bos_token:
+                scores[full_mask[input_ids_inv]] = -math.inf
+            else:
+                scores[full_mask] = -math.inf
+
+        return scores
+    
+    def __call__SINGOLO(self, input_ids, scores):
+
+        #---
+        x = "m.0v1k9hr" # valore che vogliamo non avere tra i candidati, che verrebbe preso con API
+        train_data = self.train_data
+        entity_mapping = train_data.dataset.field2token_id['entity_id']
+        #z = [] # variabile per il testing, da eliminare dopo
+        #---
+        #breakpoint()
+        current_len = input_ids.shape[-1] # current_len: lunghezza delle connessioni tra elementi tokenizzati 
+        has_bos_token = self.is_bos_token_in_input(input_ids)
+
+        if has_bos_token and current_len == self.max_sequence_length - 1:
+            self.mask_non_eos_tokens(scores) # scores: valori del logits [batch_size, n_tokens]
+        else:
+            unique_input_ids = input_ids
+            if self.task == self.RECOMMENDATION_TASK and current_len < self.max_sequence_length - 1 - has_bos_token: # se la lung non è ancora quella max
+                last_n_tokens = 2 if self.is_next_token_entity(input_ids) else 1
+                _, input_ids_indices, input_ids_inv = np.unique(
+                    input_ids.cpu().numpy()[:, -last_n_tokens:], axis=0, return_index=True, return_inverse=True
+                )
+                unique_input_ids = input_ids[input_ids_indices] 
+
+            full_mask = np.zeros((unique_input_ids.shape[0], len(self.tokenizer)), dtype=bool) # maschera per ogni elemento, in modo da abilitare solo le connessioni utili
+            
+            
+            for idx in range(unique_input_ids.shape[0]):
+
+                #---
+                hard_restriction_mask = np.zeros(len(self.tokenizer), dtype=bool) 
+                #---
+
+                if self.task == self.RECOMMENDATION_TASK:
+                    key, candidate_tokens = self.process_scores_rec(unique_input_ids, idx)
+
+                    #---
+                    # aggiorno ma maschera ber bannare i token hard-No
+                    if x in candidate_tokens:
+                        id_interno_x = entity_mapping[x]
+                        if id_interno_x < train_data.dataset.item_num:
+                            token = PathLanguageModelingTokenType.ITEM.value + str(id_interno_x) # verifichiamo se dobbiamo escludere un item
+                        else:
+                            token = PathLanguageModelingTokenType.ENTITY.value + str(id_interno_x) # altrimenti dobbiamo escludere un'entità
+                            
+                        token_id = self.tokenizer.convert_tokens_to_ids(token)
+                        hard_restriction_mask[token_id] = True
+                        #breakpoint()
+                        # Ban di tutte le entità connesse ad x
+                        if id_interno_x in self.tokenized_kg:
+                            connected_entities = self.tokenized_kg[id_interno_x].keys()
+                            #z = connected_entities # testing, da eliminare dopo
+                            for connected_entity in connected_entities:
+                                connected_token = PathLanguageModelingTokenType.ENTITY.value + str(connected_entity)
+                                connected_token_id = self.tokenizer.convert_tokens_to_ids(connected_token)
+                                hard_restriction_mask[connected_token_id] = True
+                    #---
+
+                elif self.task == self.LINK_PREDICTION_TASK:
+                    key, candidate_tokens = self.process_scores_lp(unique_input_ids, idx)
+
+                banned_mask = self.get_banned_mask(key, candidate_tokens) # assegna a banned_mask gli id dei token che non possono essere scelti
+                full_mask[idx] = banned_mask
+
+                #---
+                full_mask[idx] = np.logical_or(banned_mask, hard_restriction_mask)
+                #---
+
+            if self.task == self.RECOMMENDATION_TASK and current_len < self.max_sequence_length - 1 - has_bos_token:
+                scores[full_mask[input_ids_inv]] = -math.inf
+            else:
+                scores[full_mask] = -math.inf
+
+        #--- testing testing testing 
+        # z_token_id = []
+        # for connected_entity in z: #(z = connected_entities)
+        #    z_token = PathLanguageModelingTokenType.ENTITY.value + str(connected_entity)
+        #    z_token_id.append(self.tokenizer.convert_tokens_to_ids(connected_token))
+
+        # if z_token_id and not torch.isinf(scores[:, z_token_id]).all():
+        #    raise ValueError("Some token scores in the list z are not -inf as expected.")
+        #--- testing testing testing 
+
+        # se la maschera è tutte a true, non abbiamo più un kg valido
+        if np.all(full_mask):
+            raise RuntimeError("All tokens are masked for all input rows in full_mask.")
+
+        return scores
+
 
 
 class PrefixConstrainedLogitsProcessorWordLevel(ConstrainedLogitsProcessorWordLevel):

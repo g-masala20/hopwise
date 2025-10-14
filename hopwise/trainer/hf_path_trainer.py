@@ -12,6 +12,7 @@ from time import time
 import torch
 from transformers import DataCollatorForLanguageModeling, IntervalStrategy, Trainer, TrainerCallback
 
+from hopwise.model.logits_processor import ConstrainedLogitsProcessorWordLevelDevel, LogitsProcessorList
 from hopwise.utils import (
     dict2str,
     early_stopping,
@@ -43,6 +44,40 @@ class HFPathTrainer(Trainer):
         self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics=None)
 
         return self.control.metrics
+    
+    # Override prediction_step per includere la versione DEVEL, speriamo sia semporaneo :)
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        """
+        Sovrascrive il metodo prediction_step per aggiungere un LogitsProcessor personalizzato.
+        """
+        # Recupera i logits_processor esistenti
+        logits_processor = LogitsProcessorList()
+
+        # Aggiungi il tuo LogitsProcessor personalizzato
+        logits_processor.append(ConstrainedLogitsProcessorWordLevelDevel(
+            self.train_dataset.get_tokenized_ckg(),
+            getattr(self, "tokenized_used_ids", None),
+            getattr(self, "token_sequence_length", None),
+            self.processing_class,
+            getattr(self, "paths_per_user", None),
+            train_data=getattr(self, "train_data", None),
+            #task=ConstrainedLogitsProcessorWordLevel.RECOMMENDATION_TASK,
+            task=ConstrainedLogitsProcessorWordLevelDevel.RECOMMENDATION_TASK,
+            )
+        )
+
+        # Usa il logits_processor nella generazione
+        with torch.no_grad():
+            model.generate(
+                inputs["input_ids"],
+                logits_processor=logits_processor,
+                max_length=self.args.generation_max_length,
+                num_beams=self.args.generation_num_beams,
+            )
+
+        # Continua con il comportamento standard di prediction_step
+        return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys)
+
 
 
 class HopwiseCallback(TrainerCallback):
