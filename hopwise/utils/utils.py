@@ -470,7 +470,8 @@ def get_logits_processor(model_name):
         )
     except AttributeError:
         return getattr(
-            importlib.import_module("hopwise.model.logits_processor"), "ConstrainedLogitsProcessorWordLevel"
+            #importlib.import_module("hopwise.model.logits_processor"), "ConstrainedLogitsProcessorWordLevel"
+            importlib.import_module("hopwise.model.logits_processor"), "ConstrainedLogitsProcessorWordLevelDevel"
         )
 
 

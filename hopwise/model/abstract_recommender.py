@@ -281,6 +281,7 @@ class PathLanguageModelingRecommender(KnowledgeRecommender):
             tokenized_used_ids=dataset.get_tokenized_used_ids(),
             max_sequence_length=self.token_sequence_length,
             tokenizer=dataset.tokenizer,
+            train_dataset=dataset,  # modifica mia EHEH 
             task=KnowledgeEvaluationType.REC,
         )
         self.logits_processor_list = LogitsProcessorList([logits_processor])
