@@ -335,14 +335,14 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
             
             # DEBUG: Controlla se già mascherato dalla logica base
             if np.all(full_mask[idx]):
-                breakpoint()
+                #breakpoint()
                 print(f"DEBUG: Base mask already blocks all tokens for idx={idx} (BEFORE constraints), this is a problem!")
             
 
             # --- HARD MASKING:
 
             # Applica hard restrictions solo se i constraints esistono
-            if constraints_tokens is not None:
+            if constraints_tokens is not None and hard_restriction_keys_per_user[idx]!=[]:
 
                 hard_restriction_mask = np.zeros_like(full_mask[idx], dtype=bool)
                 
@@ -352,8 +352,8 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
                     hard_restriction_mask = np.logical_or(hard_restriction_mask, constraint_mask)
 
                     if np.all(full_mask[idx]): 
-                        print(f"DEBUG: All tokens masked for idx={idx} (constraints cycles)")
-                        raise RuntimeError("All tokens are masked for all input rows in full_mask.(constraints cycles)")
+                        print(f"DEBUG: All tokens masked for idx={idx} (h_constraints cycles)")
+                        raise RuntimeError("All tokens are masked for all input rows in full_mask.(h_constraints cycles)")
 
                 
                 # Combina maschera base con restrizioni hard
@@ -367,7 +367,7 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
             # --- SOFT MASKING:
 
             # Applica soft masking solo se i constraints esistono
-            if constraints_tokens is not None:
+            if constraints_tokens is not None and soft_restriction_keys_per_user[idx]!=[]:
                 # sintesi: vengono ordinati i valori in modo decrescente in base al numero di token connessi,
                 # viene applicata la maschera per volta, e si applica la successiva solo se il kg è valido,
                 # altrimenti si interrompe il processo 
@@ -383,35 +383,37 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
                 soft_mask = np.zeros_like(full_mask[idx], dtype=bool) # necessario? non credo
 
                 for soft_key in soft_restriction_keys_per_user[idx]:
-                    # Verifica che soft_key esista nell'entity_mapping
-                    if soft_key in entity_mapping:
-                        soft_mask = np.logical_or(full_mask[idx], self.gen_mask_from_key(soft_key, train_dataset, mask_type="ban"))
-                        if np.all(soft_mask): 
-                            break
-                        else:
-                            full_mask[idx] = soft_mask
+                    #if soft_key in entity_mapping:
+                    soft_mask = np.logical_or(full_mask[idx], self.gen_mask_from_key(soft_key, train_dataset, mask_type="ban"))
+                    if np.all(soft_mask): 
+                        break
+                    else:
+                        full_mask[idx] = soft_mask
 
             # --- PREFERENCE MASKING:
-            # (proof of concept, non usato attualmente)
-            """ if constraints_tokens is not None:
+            # (TODO: proof of concept, probaimente da rivedere)
+            if constraints_tokens is not None and preferences_keys_per_user[idx]!=[]:
                 preference_mask = np.ones_like(full_mask[idx], dtype=bool)  # Maschera inizializzata a True (tutti i nodi bannati)
 
                 # Applica le preferenze per l'utente corrente
                 for pref_key in preferences_keys_per_user[idx]:
-                    if pref_key in entity_mapping:
-                        # Abilita il nodo e i suoi vicini
-                        preference_mask[entity_mapping[pref_key]] = False                               //
-                        connected_entities = self.extract_connected_entities(entity_mapping[pref_key])  // da sostituire con gen_mask_from_key ( quella nuova :D)
-                        preference_mask[connected_entities] = False                                     //
+                    # Abilita il nodo e i suoi vicini   
+                    preference_mask = np.logical_or(full_mask[idx], self.gen_mask_from_key(pref_key, train_dataset, mask_type="allow")) 
+                    #TODO: assicurarsi che non crei sottografi separati e che tutte le preference siano rispettate allo stesso tempo, non ho la testa ora :(
+                    if np.all(preference_mask): 
+                        break
+                    else:
+                        full_mask[idx] = preference_mask
 
-                # Combina la maschera di preferenza con quella generale
-                full_mask[idx] = np.logical_and(full_mask[idx], preference_mask)
+                # Combina la maschera di preferenza con quella generale (Ma solo se non blocca tutto)
+                #if not np.all(preference_mask):
+                #    full_mask[idx] = np.logical_and(full_mask[idx], preference_mask)
 
-                    # DEBUG: Controlla se la maschera blocca tutto
+                # DEBUG: Controlla se la maschera blocca tutto
                 if np.all(full_mask[idx]):
                     print(f"DEBUG: All tokens masked for idx={idx} (AFTER preferences)")
                     raise RuntimeError("All tokens are masked for all input rows in full_mask (AFTER preferences).")
-    """
+    
         #---
 
         if self.task == KnowledgeEvaluationType.REC and current_len < self.max_sequence_length - 1 - has_bos_token:
@@ -492,7 +494,7 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
 
         mask_type = mask_type.lower().strip()
 
-        mask = np.ones(len(self.tokenizer), dtype=bool) if mask_type == "ban" else np.zeros(len(self.tokenizer), dtype=bool)
+        mask = np.zeros(len(self.tokenizer), dtype=bool) if mask_type == "ban" else np.ones(len(self.tokenizer), dtype=bool)
 
         # Ottieni l'ID interno del nodo
         id_interno = train_dataset.field2token_id['entity_id'][key]
@@ -502,12 +504,12 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
             token = PathLanguageModelingTokenType.ENTITY.value + str(id_interno)
 
         token_id = self.tokenizer.convert_tokens_to_ids(token)
-        mask[token_id] = False if mask_type == "ban" else True
+        mask[token_id] = True if mask_type == "ban" else False
 
         # Gestisci i nodi connessi
         if include_connected_entities and token_id in self.tokenized_ckg:
             connected_entities = self.extract_connected_entities(token_id)
-            mask[connected_entities] = False if mask_type == "ban" else True
+            mask[connected_entities] = True if mask_type == "ban" else False
 
         return mask
 
