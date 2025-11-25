@@ -19,6 +19,9 @@ from hopwise.utils import PathLanguageModelingTokenType
 
 import graphviz # AGGIUNTA PER LA STAMPA DEL GRAFO (che io sia maledetto)
 import pdb; #pdb.set_trace() # AGGIUNTA PER IL DEBUG (perchè ogni tanto da problemi .-.)
+import os
+import hashlib
+from concurrent.futures import ThreadPoolExecutor
 
 class LogitsProcessor:
     """
@@ -518,121 +521,116 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
 
 # --- inizio funzioni graphviz
 
-import os
-import hashlib
-from concurrent.futures import ThreadPoolExecutor
+    def extract_subgraph(tokenized_ckg, focus_nodes, depth=1):
+        """
+        Estrae un sottografo contenente i nodi specificati e i loro vicini fino a una certa profondità.
 
+        Args:
+            tokenized_ckg (dict): Dizionario che rappresenta il grafo completo.
+            focus_nodes (list): Lista di nodi da includere nel sottografo.
+            depth (int): Profondità della ricerca
 
-def extract_subgraph(tokenized_ckg, focus_nodes, depth=1):
-    """
-    Estrae un sottografo contenente i nodi specificati e i loro vicini fino a una certa profondità.
+        Returns:
+            dict: Sottografo contenente i nodi specificati e i loro vicini.
+        """
+        nodes_to_include = set(focus_nodes)
+        current_level = set(focus_nodes)
 
-    Args:
-        tokenized_ckg (dict): Dizionario che rappresenta il grafo completo.
-        focus_nodes (list): Lista di nodi da includere nel sottografo.
-        depth (int): Profondità della ricerca (1 = vicini diretti, 2 = vicini dei vicini, ecc.).
+        for _ in range(depth):
+            next_level = set()
+            for node in current_level:
+                if node in tokenized_ckg:
+                    for relation, connected_nodes in tokenized_ckg[node].items():
+                        next_level.update(connected_nodes)
+            nodes_to_include.update(next_level)
+            current_level = next_level
 
-    Returns:
-        dict: Sottografo contenente i nodi specificati e i loro vicini.
-    """
-    nodes_to_include = set(focus_nodes)
-    current_level = set(focus_nodes)
-
-    for _ in range(depth):
-        next_level = set()
-        for node in current_level:
+        # Costruisci il sottografo
+        subgraph = {}
+        for node in nodes_to_include:
             if node in tokenized_ckg:
+                subgraph[node] = {}
                 for relation, connected_nodes in tokenized_ckg[node].items():
-                    next_level.update(connected_nodes)
-        nodes_to_include.update(next_level)
-        current_level = next_level
+                    filtered_nodes = [n for n in connected_nodes if n in nodes_to_include]
+                    if filtered_nodes:
+                        subgraph[node][relation] = filtered_nodes
 
-    # Costruisci il sottografo
-    subgraph = {}
-    for node in nodes_to_include:
-        if node in tokenized_ckg:
-            subgraph[node] = {}
-            for relation, connected_nodes in tokenized_ckg[node].items():
-                filtered_nodes = [n for n in connected_nodes if n in nodes_to_include]
-                if filtered_nodes:
-                    subgraph[node][relation] = filtered_nodes
+        return subgraph
 
-    return subgraph
+    def add_edges(dot, node, edges):
+        """Aggiunge nodi e archi al grafo."""
+        dot.node(str(node), label=str(node))
+        for relation, connected_nodes in edges.items():
+            for connected_node in connected_nodes:
+                dot.edge(str(node), str(connected_node), label=str(relation))
 
-def add_edges(dot, node, edges):
-    """Aggiunge nodi e archi al grafo."""
-    dot.node(str(node), label=str(node))
-    for relation, connected_nodes in edges.items():
-        for connected_node in connected_nodes:
-            dot.edge(str(node), str(connected_node), label=str(relation))
+    def update_node_colors(dot, mask, tokenizer, banned_color="red", allowed_color="green"):
+        """
+        Aggiorna i colori dei nodi nel grafo in base a una maschera booleana.
 
-def update_node_colors(dot, mask, tokenizer, banned_color="red", allowed_color="green"):
-    """
-    Aggiorna i colori dei nodi nel grafo in base a una maschera booleana.
+        Se banned_color o allowed_color è una stringa vuota (o valore falsy), non
+        modifica il colore dei nodi di quel tipo.
+        """
+        for token_id, is_banned in enumerate(mask):
+            node_name = str(tokenizer.convert_ids_to_tokens(token_id))
+            if is_banned:
+                if banned_color:  # se vuoto -> non toccare i nodi bannati
+                    dot.node(node_name, style="filled", fillcolor=banned_color)
+            else:
+                if allowed_color:  # se vuoto -> non toccare i nodi permessi
+                    dot.node(node_name, style="filled", fillcolor=allowed_color)
 
-    Se banned_color o allowed_color è una stringa vuota (o valore falsy), non
-    modifica il colore dei nodi di quel tipo.
-    """
-    for token_id, is_banned in enumerate(mask):
-        node_name = str(tokenizer.convert_ids_to_tokens(token_id))
-        if is_banned:
-            if banned_color:  # se vuoto -> non toccare i nodi bannati
-                dot.node(node_name, style="filled", fillcolor=banned_color)
+    def convert_ckg_to_graphviz(tokenized_ckg, output_file="graph", mask=None, tokenizer=None, cache=True):
+        """
+        Converte il tokenized_ckg in un grafo stampabile con Graphviz, con supporto per caching, parallelizzazione e aggiornamento dei colori.
+
+        Args:
+            tokenized_ckg (dict): Dizionario che rappresenta il grafo.
+            output_file (str): Nome del file di output (senza estensione).
+            mask (np.ndarray): Maschera booleana (True = bannato, False = permesso).
+            tokenizer: Tokenizer per convertire gli ID dei token in stringhe.
+            cache (bool): Se True, usa il file di cache se esiste.
+
+        Returns:
+            graphviz.Digraph: Oggetto Graphviz del grafo.
+        """
+        # Calcola l'hash della struttura del grafo
+        ckg_str = str(tokenized_ckg).encode('utf-8')
+        graph_hash =  hashlib.md5(ckg_str).hexdigest()
+        cache_file = f"{output_file}_{graph_hash}.gv"
+
+        # Usa il file di cache per la struttura del grafo se esiste
+        if cache and os.path.exists(cache_file):
+            print(f"DEBUG: Usando la struttura del grafo in cache {cache_file}")
+            dot = graphviz.Source.from_file(cache_file)
         else:
-            if allowed_color:  # se vuoto -> non toccare i nodi permessi
-                dot.node(node_name, style="filled", fillcolor=allowed_color)
+            # Crea un nuovo grafo
+            dot = graphviz.Digraph(format="svg")
 
-def convert_ckg_to_graphviz(tokenized_ckg, output_file="graph", mask=None, tokenizer=None, cache=True):
-    """
-    Converte il tokenized_ckg in un grafo stampabile con Graphviz, con supporto per caching, parallelizzazione e aggiornamento dei colori.
+            # Parallelizza l'aggiunta di nodi e archi
+            with ThreadPoolExecutor() as executor:
+                futures = []
+                for node, edges in tokenized_ckg.items():
+                    futures.append(executor.submit(add_edges, dot, node, edges))
+                for future in futures:
+                    future.result()
 
-    Args:
-        tokenized_ckg (dict): Dizionario che rappresenta il grafo.
-        output_file (str): Nome del file di output (senza estensione).
-        mask (np.ndarray): Maschera booleana (True = bannato, False = permesso).
-        tokenizer: Tokenizer per convertire gli ID dei token in stringhe.
-        cache (bool): Se True, usa il file di cache se esiste.
+            # Salva la struttura del grafo in cache
+            dot.save(cache_file)
+            print(f"DEBUG: Struttura del grafo salvata in {cache_file}")
 
-    Returns:
-        graphviz.Digraph: Oggetto Graphviz del grafo.
-    """
-    # Calcola l'hash della struttura del grafo
-    ckg_str = str(tokenized_ckg).encode('utf-8')
-    graph_hash =  hashlib.md5(ckg_str).hexdigest()
-    cache_file = f"{output_file}_{graph_hash}.gv"
+        # Aggiorna i colori dei nodi in base alla maschera
+        if mask is not None and tokenizer is not None:
+            update_node_colors(dot, mask, tokenizer)
 
-    # Usa il file di cache per la struttura del grafo se esiste
-    if cache and os.path.exists(cache_file):
-        print(f"DEBUG: Usando la struttura del grafo in cache {cache_file}")
-        dot = graphviz.Source.from_file(cache_file)
-    else:
-        # Crea un nuovo grafo
-        dot = graphviz.Digraph(format="svg")
+        # Salva il grafo su file
+        try:
+            dot.render(output_file, cleanup=True)
+            print(f"DEBUG: Grafo salvato come {output_file}.svg")
+        except Exception as e:
+            print(f"DEBUG: Errore durante il rendering del grafo: {e}")
 
-        # Parallelizza l'aggiunta di nodi e archi
-        with ThreadPoolExecutor() as executor:
-            futures = []
-            for node, edges in tokenized_ckg.items():
-                futures.append(executor.submit(add_edges, dot, node, edges))
-            for future in futures:
-                future.result()
-
-        # Salva la struttura del grafo in cache
-        dot.save(cache_file)
-        print(f"DEBUG: Struttura del grafo salvata in {cache_file}")
-
-    # Aggiorna i colori dei nodi in base alla maschera
-    if mask is not None and tokenizer is not None:
-        update_node_colors(dot, mask, tokenizer)
-
-    # Salva il grafo su file
-    try:
-        dot.render(output_file, cleanup=True)
-        print(f"DEBUG: Grafo salvato come {output_file}.svg")
-    except Exception as e:
-        print(f"DEBUG: Errore durante il rendering del grafo: {e}")
-
-    return dot
+        return dot
 
 
 
