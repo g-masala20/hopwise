@@ -262,7 +262,8 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
         pos_candidates_cache_size,
         task,
         **kwargs)
-        self.train_dataset = train_dataset  
+        self.train_dataset = train_dataset
+        self._graph_generated = False  # Flag per controllare se il grafo è già stato generato
 
     def __call__(self, input_ids, scores):
 
@@ -303,9 +304,9 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
                 if user_idx_in_batch < len(constraints_tokens):
                     user_constraints = constraints_tokens[user_idx_in_batch].split(',') if constraints_tokens[user_idx_in_batch] else []
                     
-                    hard_constraints = user_constraints[:2] if len(user_constraints) >= 2 else [] # Primi 2 constraint per hard restrictions
+                    hard_constraints = user_constraints[:2] if len(user_constraints) >= 2 else [] # Primi due constraint per hard restrictions
                     soft_constraints = user_constraints[2:4] if len(user_constraints) >= 4 else [] # Terzo e quarto constraint per soft restrictions 
-                    preferences = user_constraints[4:] if len(user_constraints) > 4 else [] # Resto dei constraint come preferenze (non ancora usate)
+                    preferences = user_constraints[4:] if len(user_constraints) > 4 else [] # Resto dei constraint come preferenze (in teoria la quinta e sesta)
                     
                     hard_restriction_keys_per_user.append(hard_constraints)
                     soft_restriction_keys_per_user.append(soft_constraints)
@@ -322,6 +323,13 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
             hard_restriction_keys_per_user = [[] for _ in range(unique_input_ids.shape[0])]
             soft_restriction_keys_per_user = [[] for _ in range(unique_input_ids.shape[0])]
             preferences_keys_per_user = [[] for _ in range(unique_input_ids.shape[0])]
+
+        # ---
+
+        # STAMPA GRAFO DEL PRIMO UTENTE (prima delle restrizioni)
+        if not self._graph_generated:
+            self._debug_visualize_first_user(hard_restriction_keys_per_user, soft_restriction_keys_per_user, preferences_keys_per_user, train_dataset)
+            self._graph_generated = True
 
         full_mask = np.zeros((unique_input_ids.shape[0], len(self.tokenizer)), dtype=bool) # Maschera completa inizializzata a zero, dimensioni)
 
@@ -519,6 +527,44 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
 
         return mask
 
+    def _debug_visualize_first_user(self, hard_keys, soft_keys, pref_keys, train_dataset):
+        """Genera e salva il grafo del primo utente prima delle restrizioni."""
+        
+        print(f"DEBUG: _debug_visualize_first_user called")
+        print(f"DEBUG: hard_keys = {hard_keys}")
+        print(f"DEBUG: soft_keys = {soft_keys}")
+        print(f"DEBUG: pref_keys = {pref_keys}")
+
+        breakpoint()
+        
+        if not hard_keys or not hard_keys[0]:
+            return
+        
+        # Raccogli tutti i constraint del primo utente
+        first_user_constraints = hard_keys[0] + soft_keys[0] + pref_keys[0]
+        if not first_user_constraints:
+            return
+        
+        # Converti le chiavi in token_ids
+        entity_mapping = train_dataset.field2token_id['entity_id']
+        constraint_token_ids = []
+        for key in first_user_constraints:
+            if key in entity_mapping:
+                id_interno = entity_mapping[key]
+                if id_interno < train_dataset.item_num:
+                    token = PathLanguageModelingTokenType.ITEM.value + str(id_interno)
+                else:
+                    token = PathLanguageModelingTokenType.ENTITY.value + str(id_interno)
+                token_id = self.tokenizer.convert_tokens_to_ids(token)
+                constraint_token_ids.append(token_id)
+        
+        # Genera il grafo
+        if constraint_token_ids:
+            subgraph = ConstrainedLogitsProcessorWordLevelDevel.extract_subgraph(self.tokenized_ckg, constraint_token_ids, depth=2)
+            ConstrainedLogitsProcessorWordLevelDevel.convert_ckg_to_graphviz(subgraph, output_file="debug_first_user_before_restrictions", 
+                                    cache=False, tokenizer=self.tokenizer)
+            print(f"DEBUG: Grafo del primo utente salvato (prima delle restrizioni)")
+
 # --- inizio funzioni graphviz
 
     def extract_subgraph(tokenized_ckg, focus_nodes, depth=1):
@@ -611,7 +657,7 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
             with ThreadPoolExecutor() as executor:
                 futures = []
                 for node, edges in tokenized_ckg.items():
-                    futures.append(executor.submit(add_edges, dot, node, edges))
+                    futures.append(executor.submit(ConstrainedLogitsProcessorWordLevelDevel.add_edges, dot, node, edges))
                 for future in futures:
                     future.result()
 
@@ -621,7 +667,7 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
 
         # Aggiorna i colori dei nodi in base alla maschera
         if mask is not None and tokenizer is not None:
-            update_node_colors(dot, mask, tokenizer)
+            ConstrainedLogitsProcessorWordLevelDevel.update_node_colors(dot, mask, tokenizer)
 
         # Salva il grafo su file
         try:
