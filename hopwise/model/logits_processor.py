@@ -287,26 +287,41 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
         # ---
 
         # Estrai i constraint dal dataset (con fallback se non esiste)
-        try:
-            constraints_tokens = train_dataset.field2id_token['constraints']    
-            #print(f"DEBUG: constraints found! Length: {len(constraints_tokens)}")
 
+        constraints_tokens_map = train_dataset.field2id_token['constraints']
+        constraints_tokens = train_dataset.get_user_feature().interaction["constraints"]
+    
+        #user_feat = train_dataset.get_user_feature()   
+
+        #breakpoint()
+
+        try:
+            #constraints_col = user_feat.interaction.get('constraints', None)
+            
             # Solo se i constraints esistono, procedi con il sistema di restrizioni
             hard_restriction_keys_per_user = []
             soft_restriction_keys_per_user = []
             preferences_keys_per_user = []
-            
+
+            user_constraints_ids = constraints_tokens[user_idx_in_batch]
+            user_constraints_tokens = constraints_tokens_map[user_constraints_ids]
+            #breakpoint()
+
             for idx in range(unique_input_ids.shape[0]):
                 user_position = 1 if has_bos_token else 0
                 user_idx_in_batch = unique_input_ids[idx, user_position].item()
-                
+
                 # TODO: potrei far diventare tutto una funzione? boh magari dopo se serve
                 if user_idx_in_batch < len(constraints_tokens):
-                    user_constraints = constraints_tokens[user_idx_in_batch].split(',') if constraints_tokens[user_idx_in_batch] else []
                     
-                    hard_constraints = user_constraints[:2] if len(user_constraints) >= 2 else [] # Primi due constraint per hard restrictions
-                    soft_constraints = user_constraints[2:4] if len(user_constraints) >= 4 else [] # Terzo e quarto constraint per soft restrictions 
-                    preferences = user_constraints[4:] if len(user_constraints) > 4 else [] # Resto dei constraint come preferenze (in teoria la quinta e sesta)
+                    if isinstance(user_constraints_tokens, str):
+                        user_constraints_list = [user_constraints_tokens]
+                    else:
+                        user_constraints_list = list(user_constraints_tokens)
+
+                    hard_constraints = user_constraints_list[:2] if len(user_constraints_list) >= 2 else [] # Primi due constraint per hard restrictions
+                    soft_constraints = user_constraints_list[2:4] if len(user_constraints_list) >= 4 else [] # Terzo e quarto constraint per soft restrictions 
+                    preferences = user_constraints_list[4:] if len(user_constraints_list) > 4 else [] # Resto dei constraint come preferenze (in teoria la quinta e sesta)
                     
                     hard_restriction_keys_per_user.append(hard_constraints)
                     soft_restriction_keys_per_user.append(soft_constraints)
@@ -316,9 +331,13 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
                     hard_restriction_keys_per_user.append([])
                     soft_restriction_keys_per_user.append([])
                     preferences_keys_per_user.append([])
+
+
+            #breakpoint()
             
-        except KeyError:
-            # Se 'constraints' non esiste, salta tutto il sistema di constraints (creiamo delle liste vuote per evitare problemi)
+        except (KeyError, AttributeError) as e:
+            # Se il dataset non ha constraints, usa liste vuote per tutti gli utenti
+            print(f"WARNING: Constraints not available in dataset: {e}")
             constraints_tokens = None
             hard_restriction_keys_per_user = [[] for _ in range(unique_input_ids.shape[0])]
             soft_restriction_keys_per_user = [[] for _ in range(unique_input_ids.shape[0])]
@@ -332,7 +351,7 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
             self._graph_generated = True
 
         full_mask = np.zeros((unique_input_ids.shape[0], len(self.tokenizer)), dtype=bool) # Maschera completa inizializzata a zero, dimensioni)
-
+        breakpoint()
         # ---
 
         for idx in range(unique_input_ids.shape[0]):
@@ -349,9 +368,8 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
             
             # DEBUG: Controlla se già mascherato dalla logica base
             if np.all(full_mask[idx]):
-                breakpoint()
+                #breakpoint()
                 print(f"DEBUG: Base mask already blocks all tokens for idx={idx} (BEFORE constraints), this is a problem!")
-            
 
             # --- HARD MASKING:
 
@@ -537,10 +555,9 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
 
         breakpoint()
         
+        # per evitare un crash se sono vuoti, si potrebbe fare meglio ma finchè funziona va bene
         if not hard_keys or not hard_keys[0]:
             return
-        
-        # Raccogli tutti i constraint del primo utente
         first_user_constraints = hard_keys[0] + soft_keys[0] + pref_keys[0]
         if not first_user_constraints:
             return
