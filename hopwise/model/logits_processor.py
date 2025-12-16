@@ -290,6 +290,9 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
 
         constraints_tokens_map = train_dataset.field2id_token['constraints']
         constraints_tokens = train_dataset.get_user_feature().interaction["constraints"]
+
+        def usertoken_tokenizer2id(_id):
+            return int(self.tokenizer.convert_ids_to_tokens(_id)[1:])
     
         #user_feat = train_dataset.get_user_feature()   
 
@@ -299,26 +302,28 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
             #constraints_col = user_feat.interaction.get('constraints', None)
             
             # Solo se i constraints esistono, procedi con il sistema di restrizioni
-            hard_restriction_keys_per_user = []
-            soft_restriction_keys_per_user = []
-            preferences_keys_per_user = []
+            hard_restriction_keys_per_user = [[] for _ in range(unique_input_ids.shape[0])]
+            soft_restriction_keys_per_user = [[] for _ in range(unique_input_ids.shape[0])]
+            preferences_keys_per_user = [[] for _ in range(unique_input_ids.shape[0])]
 
-            breakpoint()
+            #breakpoint()
 
             for idx in range(unique_input_ids.shape[0]):
                 user_position = 1 if has_bos_token else 0
                 user_idx_in_batch = unique_input_ids[idx, user_position].item()
 
-                print(f"DEBUG: Processing user_idx_in_batch={user_idx_in_batch}")
+                #print(f"DEBUG: Processing user_idx_in_batch={user_idx_in_batch}")
 
-                user_constraints_ids = constraints_tokens[user_idx_in_batch]
-                user_constraints_tokens = constraints_tokens_map[user_constraints_ids]
+                remapped_user_idx_in_batch = usertoken_tokenizer2id(user_idx_in_batch)
+                user_constraints_ids = constraints_tokens[remapped_user_idx_in_batch]
+                user_constraints_tokens = constraints_tokens_map[user_constraints_ids].split(',')
+                user_constraints_ids = [entity_mapping[constraint] for constraint in user_constraints_tokens]
 
                 #debug print
-                print(f"DEBUG: user_idx_in_batch={user_idx_in_batch}, user_constraints_tokens={user_constraints_tokens}")
+                #print(f"DEBUG: user_idx_in_batch={user_idx_in_batch}, user_constraints_tokens={user_constraints_tokens}")
 
                 # TODO: potrei far diventare tutto una funzione? boh magari dopo se serve
-                if user_idx_in_batch < len(constraints_tokens):
+                if user_constraints_tokens != ['']:
                     
                     if isinstance(user_constraints_tokens, str):
                         user_constraints_list = [user_constraints_tokens]
@@ -334,6 +339,7 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
                     preferences_keys_per_user[idx].append(preferences)
                 else:
                     # Fallback per utenti senza constraints
+                    # WARNING: Constraints not available in dataset: 'NoneType' object has no attribute 'append'
                     hard_restriction_keys_per_user[idx].append([])
                     soft_restriction_keys_per_user[idx].append([])
                     preferences_keys_per_user[idx].append([])
@@ -351,9 +357,9 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
 
         # ---
 
-        # STAMPA GRAFO DEL PRIMO UTENTE (prima delle restrizioni)
+        # STAMPA GRAFO DEL PRIMO UTENTE (prima DELLE restrizioni)
         if not self._graph_generated:
-            self._debug_visualize_first_user(hard_restriction_keys_per_user, soft_restriction_keys_per_user, preferences_keys_per_user, train_dataset)
+            self._debug_visualize_first_user(hard_restriction_keys_per_user[0], soft_restriction_keys_per_user[0], preferences_keys_per_user[0], train_dataset)
             self._graph_generated = True
 
         full_mask = np.zeros((unique_input_ids.shape[0], len(self.tokenizer)), dtype=bool) # Maschera completa inizializzata a zero, dimensioni)
@@ -559,7 +565,7 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
         print(f"DEBUG: soft_keys = {soft_keys}")
         print(f"DEBUG: pref_keys = {pref_keys}")
 
-        breakpoint()
+        #breakpoint()
         
         # per evitare un crash se sono vuoti, si potrebbe fare meglio ma finchè funziona va bene
         if not hard_keys or not hard_keys[0]:
@@ -575,9 +581,11 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
             if key in entity_mapping:
                 id_interno = entity_mapping[key]
                 if id_interno < train_dataset.item_num:
-                    token = PathLanguageModelingTokenType.ITEM.value + str(id_interno)
+                    # CORRETTO: usa [0] per ottenere la stringa dalla tupla
+                    token = PathLanguageModelingTokenType.ITEM.value[0] + str(id_interno)
                 else:
-                    token = PathLanguageModelingTokenType.ENTITY.value + str(id_interno)
+                    # CORRETTO: usa [0] per ottenere la stringa dalla tupla
+                    token = PathLanguageModelingTokenType.ENTITY.value[0] + str(id_interno)
                 token_id = self.tokenizer.convert_tokens_to_ids(token)
                 constraint_token_ids.append(token_id)
         
@@ -585,7 +593,7 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
         if constraint_token_ids:
             subgraph = ConstrainedLogitsProcessorWordLevelDevel.extract_subgraph(self.tokenized_ckg, constraint_token_ids, depth=2)
             ConstrainedLogitsProcessorWordLevelDevel.convert_ckg_to_graphviz(subgraph, output_file="debug_first_user_before_restrictions", 
-                                    cache=False, tokenizer=self.tokenizer)
+                                cache=False, tokenizer=self.tokenizer)
             print(f"DEBUG: Grafo del primo utente salvato (prima delle restrizioni)")
 
 # --- inizio funzioni graphviz
