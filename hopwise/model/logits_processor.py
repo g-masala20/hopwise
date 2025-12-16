@@ -303,13 +303,19 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
             soft_restriction_keys_per_user = []
             preferences_keys_per_user = []
 
-            user_constraints_ids = constraints_tokens[user_idx_in_batch]
-            user_constraints_tokens = constraints_tokens_map[user_constraints_ids]
-            #breakpoint()
+            breakpoint()
 
             for idx in range(unique_input_ids.shape[0]):
                 user_position = 1 if has_bos_token else 0
                 user_idx_in_batch = unique_input_ids[idx, user_position].item()
+
+                print(f"DEBUG: Processing user_idx_in_batch={user_idx_in_batch}")
+
+                user_constraints_ids = constraints_tokens[user_idx_in_batch]
+                user_constraints_tokens = constraints_tokens_map[user_constraints_ids]
+
+                #debug print
+                print(f"DEBUG: user_idx_in_batch={user_idx_in_batch}, user_constraints_tokens={user_constraints_tokens}")
 
                 # TODO: potrei far diventare tutto una funzione? boh magari dopo se serve
                 if user_idx_in_batch < len(constraints_tokens):
@@ -323,14 +329,14 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
                     soft_constraints = user_constraints_list[2:4] if len(user_constraints_list) >= 4 else [] # Terzo e quarto constraint per soft restrictions 
                     preferences = user_constraints_list[4:] if len(user_constraints_list) > 4 else [] # Resto dei constraint come preferenze (in teoria la quinta e sesta)
                     
-                    hard_restriction_keys_per_user.append(hard_constraints)
-                    soft_restriction_keys_per_user.append(soft_constraints)
-                    preferences_keys_per_user.append(preferences)
+                    hard_restriction_keys_per_user[idx].append(hard_constraints)
+                    soft_restriction_keys_per_user[idx].append(soft_constraints)
+                    preferences_keys_per_user[idx].append(preferences)
                 else:
                     # Fallback per utenti senza constraints
-                    hard_restriction_keys_per_user.append([])
-                    soft_restriction_keys_per_user.append([])
-                    preferences_keys_per_user.append([])
+                    hard_restriction_keys_per_user[idx].append([])
+                    soft_restriction_keys_per_user[idx].append([])
+                    preferences_keys_per_user[idx].append([])
 
 
             #breakpoint()
