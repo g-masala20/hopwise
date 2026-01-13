@@ -334,15 +334,15 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
                     soft_constraints = user_constraints_list[2:4] if len(user_constraints_list) >= 4 else [] # Terzo e quarto constraint per soft restrictions 
                     preferences = user_constraints_list[4:] if len(user_constraints_list) > 4 else [] # Resto dei constraint come preferenze (in teoria la quinta e sesta)
                     
-                    hard_restriction_keys_per_user[idx].append(hard_constraints)
-                    soft_restriction_keys_per_user[idx].append(soft_constraints)
-                    preferences_keys_per_user[idx].append(preferences)
+                    hard_restriction_keys_per_user[idx].extend(hard_constraints)
+                    soft_restriction_keys_per_user[idx].extend(soft_constraints)
+                    preferences_keys_per_user[idx].extend(preferences)
                 else:
                     # Fallback per utenti senza constraints
                     # WARNING: Constraints not available in dataset: 'NoneType' object has no attribute 'append'
-                    hard_restriction_keys_per_user[idx].append([])
-                    soft_restriction_keys_per_user[idx].append([])
-                    preferences_keys_per_user[idx].append([])
+                    hard_restriction_keys_per_user[idx].extend([])
+                    soft_restriction_keys_per_user[idx].extend([])
+                    preferences_keys_per_user[idx].extend([])
 
 
             #breakpoint()
@@ -359,11 +359,21 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
 
         # STAMPA GRAFO DEL PRIMO UTENTE (prima DELLE restrizioni)
         if not self._graph_generated:
-            self._debug_visualize_first_user(hard_restriction_keys_per_user[0], soft_restriction_keys_per_user[0], preferences_keys_per_user[0], train_dataset)
+            # Grafo senza restrizioni
+            self._debug_visualize_first_user(hard_restriction_keys_per_user[0], 
+                                                soft_restriction_keys_per_user[0], 
+                                                preferences_keys_per_user[0], 
+                                                train_dataset)
+            # Grafo con hard restrictions evidenziate
+            #self._debug_visualize_first_user_with_hard_restrictions(hard_restriction_keys_per_user[0],
+            #                                                        soft_restriction_keys_per_user[0],
+            #                                                        preferences_keys_per_user[0],
+            #                                                        train_dataset)
             self._graph_generated = True
 
         full_mask = np.zeros((unique_input_ids.shape[0], len(self.tokenizer)), dtype=bool) # Maschera completa inizializzata a zero, dimensioni)
-        breakpoint()
+        #breakpoint()
+
         # ---
 
         for idx in range(unique_input_ids.shape[0]):
@@ -399,6 +409,10 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
                         print(f"DEBUG: All tokens masked for idx={idx} (h_constraints cycles)")
                         raise RuntimeError("All tokens are masked for all input rows in full_mask.(h_constraints cycles)")
 
+                # STAMPA GRAFO DEL PRIMO UTENTE (dopo le hard restrictions)
+                if idx == 0:
+                    self._debug_visualize_first_user_with_hard_restrictions(hard_restriction_keys_per_user[idx], soft_restriction_keys_per_user[idx], preferences_keys_per_user[idx], train_dataset, full_mask[idx])
+
                 
                 # Combina maschera base con restrizioni hard
                 full_mask[idx] = np.logical_or(banned_mask, hard_restriction_mask)
@@ -407,7 +421,8 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
                 print(f"DEBUG: All tokens masked for idx={idx} (AFTER constraints)")
                 raise RuntimeError("All tokens are masked for all input rows in full_mask.(AFTER constraints)")
 
-
+            
+            breakpoint()
             # --- SOFT MASKING:
 
             # Applica soft masking solo se i constraints esistono
@@ -543,9 +558,9 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
         # Ottieni l'ID interno del nodo
         id_interno = train_dataset.field2token_id['entity_id'][key]
         if id_interno < train_dataset.item_num:
-            token = PathLanguageModelingTokenType.ITEM.value + str(id_interno)
+            token = [PathLanguageModelingTokenType.ITEM.value[0]] + str(id_interno)
         else:
-            token = PathLanguageModelingTokenType.ENTITY.value + str(id_interno)
+            token = PathLanguageModelingTokenType.ENTITY.value[0] + str(id_interno)
 
         token_id = self.tokenizer.convert_tokens_to_ids(token)
         mask[token_id] = True if mask_type == "ban" else False
@@ -581,20 +596,80 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
             if key in entity_mapping:
                 id_interno = entity_mapping[key]
                 if id_interno < train_dataset.item_num:
-                    # CORRETTO: usa [0] per ottenere la stringa dalla tupla
                     token = PathLanguageModelingTokenType.ITEM.value[0] + str(id_interno)
                 else:
-                    # CORRETTO: usa [0] per ottenere la stringa dalla tupla
                     token = PathLanguageModelingTokenType.ENTITY.value[0] + str(id_interno)
                 token_id = self.tokenizer.convert_tokens_to_ids(token)
                 constraint_token_ids.append(token_id)
         
         # Genera il grafo
         if constraint_token_ids:
-            subgraph = ConstrainedLogitsProcessorWordLevelDevel.extract_subgraph(self.tokenized_ckg, constraint_token_ids, depth=2)
-            ConstrainedLogitsProcessorWordLevelDevel.convert_ckg_to_graphviz(subgraph, output_file="debug_first_user_before_restrictions", 
-                                cache=False, tokenizer=self.tokenizer)
+            subgraph = ConstrainedLogitsProcessorWordLevelDevel.extract_subgraph(self.tokenized_ckg, constraint_token_ids, depth=1) # TODO: DEPTH 2! al momento è a 1 per fare prove
+            
+            ConstrainedLogitsProcessorWordLevelDevel.convert_ckg_to_graphviz(
+                subgraph, 
+                output_file="debug_first_user_before_restrictions", 
+                cache=False, 
+                tokenizer=self.tokenizer
+            )
             print(f"DEBUG: Grafo del primo utente salvato (prima delle restrizioni)")
+
+    def _debug_visualize_first_user_with_hard_restrictions(self, hard_keys, soft_keys, pref_keys, train_dataset, hard_restriction_mask):
+        """
+        Genera e salva il grafo del primo utente mostrando in rosso i nodi bannati dalle hard restrictions.
+        
+        Args:
+            hard_keys: Lista di chiavi per hard restrictions
+            soft_keys: Lista di chiavi per soft restrictions
+            pref_keys: Lista di chiavi per preferences
+            train_dataset: Dataset di training contenente i mapping
+        """
+        print(f"DEBUG: _debug_visualize_first_user_with_hard_restrictions called")
+        print(f"DEBUG: hard_keys = {hard_keys}")
+        print(f"DEBUG: soft_keys = {soft_keys}")
+        print(f"DEBUG: pref_keys = {pref_keys}")
+        
+        # Validazione input
+        if not hard_keys or not hard_keys[0]:
+            print("DEBUG: Nessuna hard restriction da visualizzare")
+            return
+        
+        first_user_constraints = hard_keys[0] + soft_keys[0] + pref_keys[0]
+        if not first_user_constraints:
+            return
+        
+        # Converti le chiavi in token_ids
+        entity_mapping = train_dataset.field2token_id['entity_id']
+        constraint_token_ids = []
+        for key in first_user_constraints:
+            if key in entity_mapping:
+                id_interno = entity_mapping[key]
+                if id_interno < train_dataset.item_num:
+                    token = PathLanguageModelingTokenType.ITEM.value[0] + str(id_interno)
+                else:
+                    token = PathLanguageModelingTokenType.ENTITY.value[0] + str(id_interno)
+                token_id = self.tokenizer.convert_tokens_to_ids(token)
+                constraint_token_ids.append(token_id)
+        
+        if not constraint_token_ids:
+            return
+        
+        # Estrai il sottografo
+        subgraph = ConstrainedLogitsProcessorWordLevelDevel.extract_subgraph(
+            self.tokenized_ckg, constraint_token_ids, depth=1
+        )
+        
+        # Converti il grafo in Graphviz applicando la maschera
+        ConstrainedLogitsProcessorWordLevelDevel.convert_ckg_to_graphviz(
+            subgraph, 
+            output_file="debug_first_user_with_hard_restrictions",
+            mask=hard_restriction_mask,
+            tokenizer=self.tokenizer,
+            cache=False
+        )
+        
+        print(f"DEBUG: Grafo con hard restrictions salvato come debug_first_user_with_hard_restrictions.svg")
+        print(f"DEBUG: Nodi bannati (rossi): {np.sum(hard_restriction_mask)} su {len(self.tokenizer)} totali")
 
 # --- inizio funzioni graphviz
 
@@ -634,20 +709,23 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
 
         return subgraph
 
-    def add_edges(dot, node, edges):
-        """Aggiunge nodi e archi al grafo."""
+    def add_edges(dot, node, edges, subgraph_nodes=None):
+        """Aggiunge nodi e archi al grafo, filtrando archi verso nodi non presenti nel sottografo."""
         dot.node(str(node), label=str(node))
         for relation, connected_nodes in edges.items():
             for connected_node in connected_nodes:
-                dot.edge(str(node), str(connected_node), label=str(relation))
+                # Disegna l'arco solo se il nodo connesso è nel sottografo
+                if subgraph_nodes is None or connected_node in subgraph_nodes:
+                    dot.edge(str(node), str(connected_node), label=str(relation))
 
-    def update_node_colors(dot, mask, tokenizer, banned_color="red", allowed_color="green"):
+    def update_node_colors(dot, mask, tokenizer, banned_color="", allowed_color=""):
         """
         Aggiorna i colori dei nodi nel grafo in base a una maschera booleana.
 
         Se banned_color o allowed_color è una stringa vuota (o valore falsy), non
         modifica il colore dei nodi di quel tipo.
         """
+        
         for token_id, is_banned in enumerate(mask):
             node_name = str(tokenizer.convert_ids_to_tokens(token_id))
             if is_banned:
@@ -666,39 +744,46 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
             output_file (str): Nome del file di output (senza estensione).
             mask (np.ndarray): Maschera booleana (True = bannato, False = permesso).
             tokenizer: Tokenizer per convertire gli ID dei token in stringhe.
-            cache (bool): Se True, usa il file di cache se esiste.
+            cache (bool): Se True, usa il file di cache se esiste (disabilitato se mask è presente).
 
         Returns:
             graphviz.Digraph: Oggetto Graphviz del grafo.
         """
+        # Disabilita la cache se c'è una maschera (perché la maschera cambia i colori)
+        use_cache = cache and mask is None
+        
         # Calcola l'hash della struttura del grafo
         ckg_str = str(tokenized_ckg).encode('utf-8')
         graph_hash =  hashlib.md5(ckg_str).hexdigest()
         cache_file = f"{output_file}_{graph_hash}.gv"
 
         # Usa il file di cache per la struttura del grafo se esiste
-        if cache and os.path.exists(cache_file):
+        if use_cache and os.path.exists(cache_file):
             print(f"DEBUG: Usando la struttura del grafo in cache {cache_file}")
             dot = graphviz.Source.from_file(cache_file)
         else:
             # Crea un nuovo grafo
             dot = graphviz.Digraph(format="svg")
 
+            # Ottieni l'insieme dei nodi del sottografo per il filtro
+            subgraph_nodes = set(tokenized_ckg.keys())
+
             # Parallelizza l'aggiunta di nodi e archi
             with ThreadPoolExecutor() as executor:
                 futures = []
                 for node, edges in tokenized_ckg.items():
-                    futures.append(executor.submit(ConstrainedLogitsProcessorWordLevelDevel.add_edges, dot, node, edges))
+                    futures.append(executor.submit(ConstrainedLogitsProcessorWordLevelDevel.add_edges, dot, node, edges, subgraph_nodes))
                 for future in futures:
                     future.result()
 
-            # Salva la struttura del grafo in cache
-            dot.save(cache_file)
-            print(f"DEBUG: Struttura del grafo salvata in {cache_file}")
+            # Salva la struttura del grafo in cache solo se non c'è la maschera
+            if use_cache:
+                dot.save(cache_file)
+                print(f"DEBUG: Struttura del grafo salvata in {cache_file}")
 
         # Aggiorna i colori dei nodi in base alla maschera
         if mask is not None and tokenizer is not None:
-            ConstrainedLogitsProcessorWordLevelDevel.update_node_colors(dot, mask, tokenizer)
+            ConstrainedLogitsProcessorWordLevelDevel.update_node_colors(dot, mask, tokenizer, banned_color="red", allowed_color="lightgreen")
 
         # Salva il grafo su file
         try:
