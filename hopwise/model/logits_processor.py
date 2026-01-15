@@ -487,7 +487,7 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
                 for pref_key in preferences_keys_per_user[idx]:
                     # Abilita il nodo e i suoi vicini   
                     preference_mask = np.logical_or(full_mask[idx], self.gen_mask_from_key(pref_key, train_dataset, mask_type="allow")) 
-                    _tmp_debug_restrictions_mask = np.logical_or(_debug_restrictions_mask, self.gen_mask_from_key(pref_key, train_dataset, mask_type="allow "))
+                    _tmp_debug_restrictions_mask = np.logical_or(_debug_restrictions_mask, self.gen_mask_from_key(pref_key, train_dataset, mask_type="allow"))
                     if np.all(preference_mask): 
                         break
                     else:
