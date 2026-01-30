@@ -282,6 +282,7 @@ class PathLanguageModelingRecommender(KnowledgeRecommender):
             max_sequence_length=self.token_sequence_length,
             tokenizer=dataset.tokenizer,
             train_dataset=dataset,  # modifica mia EHEH 
+            model=self,  # passa riferimento al model per path generation
             task=KnowledgeEvaluationType.REC,
         )
         self.logits_processor_list = LogitsProcessorList([logits_processor])

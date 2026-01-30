@@ -17,9 +17,8 @@ from hopwise.utils import KnowledgeEvaluationType
 import random
 from hopwise.utils import PathLanguageModelingTokenType
 
-import graphviz # AGGIUNTA PER LA STAMPA DEL GRAFO (che io sia maledetto)
-import igraph # AGGIUNTA PER IGRAPH
-import pdb; #pdb.set_trace() # AGGIUNTA PER IL DEBUG (perchè ogni tanto da problemi .-.)
+import igraph
+import pdb; #pdb.set_trace() 
 import os
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
@@ -249,6 +248,7 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
         max_sequence_length,
         tokenizer,
         train_dataset,  # aggiunta mia 
+        model=None,  # aggiunta per path generation
         mask_cache_size=3 * 10**4,
         pos_candidates_cache_size=1 * 10**5,
         task=KnowledgeEvaluationType.REC,
@@ -264,7 +264,7 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
         task,
         **kwargs)
         self.train_dataset = train_dataset
-        self._graph_generated = False  # Flag per controllare se il grafo è già stato generato
+        self.model = model  # Salva riferimento al model per path generation
 
     def __call__(self, input_ids, scores):
 
@@ -357,15 +357,27 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
         # ---
 
         # STAMPA GRAFO DEL PRIMO UTENTE (PRIMA delle restrizioni)
-        if self._graph_generated is False:  # Controllo esplicito per evitare problemi con None
-            # Grafo senza restrizioni
-            self._debug_visualize_graph(hard_restriction_keys_per_user[0], 
-                soft_restriction_keys_per_user[0], 
-                preferences_keys_per_user[0], 
-                train_dataset,
-                output_file="debug_first_user_no_restrictions"
-            )
-            self._graph_generated = True  # Imposta il flag per evitare di rigenerare il grafo
+        # Verifica se il primo utente nel batch è effettivamente il primo utente del dataset (ID 0)
+        if unique_input_ids.shape[0] > 0:
+            user_position = 1 if has_bos_token else 0
+            first_user_token_id = unique_input_ids[0, user_position].item()
+            first_user_dataset_id = usertoken_tokenizer2id(first_user_token_id)
+            
+            if first_user_dataset_id == 0 and not os.path.exists("debug_first_user_no_restrictions.graphml"):
+                # Genera il path per il primo utente
+                first_user_input = unique_input_ids[0:1, :].clone()
+                generated_path_tokens = self._generate_path_tokens(first_user_input)
+                print(f"DEBUG: generated_path_tokens = {generated_path_tokens}")
+                
+                # Grafo senza restrizioni (con path evidenziato se generato)
+                self._debug_visualize_graph(
+                    hard_restriction_keys_per_user[0], 
+                    soft_restriction_keys_per_user[0], 
+                    preferences_keys_per_user[0], 
+                    train_dataset,
+                    path_tokens=generated_path_tokens,
+                    output_file="debug_first_user_no_restrictions"
+                )
 
         full_mask = np.zeros((unique_input_ids.shape[0], len(self.tokenizer)), dtype=bool) # Maschera completa inizializzata a zero, dimensioni)
         #breakpoint()
@@ -395,7 +407,7 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
 
             # Applica hard restrictions solo se i constraints esistono
             if constraints_tokens is not None and hard_restriction_keys_per_user[idx]!=[]:
-                #print(f"DEBUG: Applying hard restrictions for idx={idx}: {hard_restriction_keys_per_user[idx]}")
+                #print(f"DEBUG: Applying hard restrictions for user idx={idx} (dataset_id={remapped_user_idx_in_batch}): {hard_restriction_keys_per_user[idx]}")
 
                 hard_restriction_mask = np.zeros_like(full_mask[idx], dtype=bool)
                 
@@ -408,10 +420,10 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
                 full_mask[idx] = np.logical_or(banned_mask, hard_restriction_mask)
                 _debug_restrictions_mask = np.logical_or(_debug_restrictions_mask, hard_restriction_mask)
                 
-                #print(f"DEBUG: Banned mask sum: {np.sum(banned_mask)}, Hard restriction mask sum: {np.sum(hard_restriction_mask)}, Combined: {np.sum(full_mask[idx])}")
+                #print(f"DEBUG: Banned mask sum: {np.sum(banned_mask)}, Hard restriction mask sum: {np.sum(hard_restriction_mask)}, Combined: {np.sum(full_mask[idx])}, Total vocab: {len(self.tokenizer)}")
 
                 # STAMPA GRAFO DEL PRIMO UTENTE (DOPO le hard restrictions)
-                if idx == 0 and self._graph_generated == True:  # Solo la prima volta e solo se il primo grafo è stato generato
+                if remapped_user_idx_in_batch == 0 and not os.path.exists("debug_first_user_hard_restrictions.graphml"):
                     self._debug_visualize_graph(
                         hard_restriction_keys_per_user[idx], 
                         soft_restriction_keys_per_user[idx], 
@@ -421,12 +433,13 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
                         banned_color="red",
                         allowed_color="lightblue",
                         output_file="debug_first_user_hard_restrictions")
-                    #self._graph_generated = None  # Imposta a None per evitare ulteriori stampe
         
-                # Controlla se tutte le maschere sono attive DOPO aver applicato hard restrictions e stampato il grafo
-                if np.all(full_mask[idx]):    
-                    print(f"DEBUG: All tokens masked for idx={idx} (AFTER hard constraints)")
-                    raise RuntimeError("All tokens are masked for all input rows in full_mask.(AFTER constraints)")
+                # Controlla se tutte le maschere sono attive DOPO aver applicato hard restrictions
+                if np.all(full_mask[idx]):
+                    print(f"ERROR: Hard restrictions block all tokens for user idx={idx} (dataset_id={remapped_user_idx_in_batch})")
+                    print(f"ERROR: Hard restriction keys: {hard_restriction_keys_per_user[idx]}")
+                    print(f"ERROR: Base mask blocks {np.sum(banned_mask)} tokens, hard restrictions block {np.sum(hard_restriction_mask)} tokens")
+                    raise RuntimeError(f"Hard restrictions block all tokens for user {remapped_user_idx_in_batch}. Check constraint configuration.")
             
 
             #breakpoint()
@@ -459,12 +472,14 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
                         full_mask[idx] = soft_mask
                         _debug_restrictions_mask = _tmp_debug_restrictions_mask
                         #_debug_restrictions_mask = np.logical_or(_debug_restrictions_mask, soft_mask)
-                # DEBUG: Controlla se la maschera blocca tutto
+                
+                # DEBUG: Controlla se la maschera blocca tutto (warning, non errore)
                 if np.all(full_mask[idx]):
-                    print(f"DEBUG: All tokens masked for idx={idx} (AFTER soft constraints)")
-                    raise RuntimeError("All tokens are masked for all input rows in full_mask (AFTER soft constraints).")
+                    print(f"WARNING: All tokens masked for idx={idx} (AFTER soft constraints), reverting to pre-soft mask")
+                    # Ripristina la maschera precedente (con solo hard restrictions)
+                    full_mask[idx] = banned_mask if constraints_tokens is None or hard_restriction_keys_per_user[idx]==[] else np.logical_or(banned_mask, hard_restriction_mask)
 
-                if idx == 0 and self._graph_generated == True:  # Solo la prima volta e solo se il primo grafo è stato generato
+                if remapped_user_idx_in_batch == 0 and not os.path.exists("debug_first_user_soft_restrictions.graphml"):
                     self._debug_visualize_graph(
                         hard_restriction_keys_per_user[idx], 
                         soft_restriction_keys_per_user[idx], 
@@ -474,7 +489,6 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
                         banned_color="red",
                         allowed_color="lightblue",
                         output_file="debug_first_user_soft_restrictions")
-                    #self._graph_generated = None  # Imposta a None per evitare ulteriori stampe
 
             #breakpoint()
 
@@ -493,12 +507,14 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
                     else:
                         full_mask[idx] = preference_mask
                         _debug_restrictions_mask = _tmp_debug_restrictions_mask
-                # DEBUG: Controlla se la maschera blocca tutto
-                if np.all(full_mask[idx]):
-                    print(f"DEBUG: All tokens masked for idx={idx} (AFTER preferences)")
-                    raise RuntimeError("All tokens are masked for all input rows in full_mask (AFTER preferences).")
                 
-                if idx == 0 and self._graph_generated == True:  # Solo la prima volta e solo se il primo grafo è stato generato
+                # DEBUG: Controlla se la maschera blocca tutto (warning, non errore)
+                if np.all(full_mask[idx]):
+                    print(f"WARNING: All tokens masked for idx={idx} (AFTER preferences), reverting to pre-preference mask")
+                    # Ripristina la maschera precedente
+                    full_mask[idx] = banned_mask  # Semplificazione: torna alla maschera base
+                
+                if remapped_user_idx_in_batch == 0 and not os.path.exists("debug_first_user_preference_restrictions.graphml"):
                     self._debug_visualize_graph(
                         hard_restriction_keys_per_user[idx], 
                         soft_restriction_keys_per_user[idx], 
@@ -508,9 +524,8 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
                         banned_color="grey",
                         allowed_color="lightblue",
                         output_file="debug_first_user_preference_restrictions")
-                    self._graph_generated = None  # Imposta a None per evitare ulteriori stampe
 
-        breakpoint()
+        #breakpoint() papopepoparapapapapapi
     
         #---
 
@@ -611,7 +626,37 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
 
         return mask
 
-    def _debug_visualize_graph(self, hard_keys, soft_keys, pref_keys, train_dataset, mask=None, output_file="debug_graph", banned_color=None, allowed_color=None):
+    def _generate_path_tokens(self, input_ids, paths_per_user=1, top_k=None):
+        """Genera percorsi dal modello e restituisce la lista di token IDs del primo path.
+
+        Args:
+            input_ids (torch.Tensor): input per la generazione (batch_size >= 1)
+            paths_per_user (int): numero di percorsi da generare per ogni riga di input
+            top_k (int|None): eventuale top-k sampling
+
+        Returns:
+            list|None: token IDs del primo path generato, o None se fallisce/assente.
+        """
+        if self.model is None:
+            return None
+
+        try:
+            outputs = ConstrainedLogitsProcessorWordLevelDevel.generate_path_with_mask(
+                model=self.model,
+                input_ids=input_ids,
+                paths_per_user=paths_per_user,
+                top_k=top_k,
+            )
+            if outputs is not None and len(outputs) > 0:
+                tokens = outputs[0].detach().cpu().tolist()
+                print(f"DEBUG: Path generato con {len(tokens)} token")
+                return tokens
+        except Exception as e:
+            print(f"DEBUG: Errore nella generazione del path: {e}")
+
+        return None
+
+    def _debug_visualize_graph(self, hard_keys, soft_keys, pref_keys, train_dataset, mask=None, output_file="debug_graph", banned_color=None, allowed_color=None, path_tokens=None):
         """Genera e salva il grafo, colorando i nodi in base alla maschera se fornita.
         
         Args:
@@ -670,13 +715,15 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
                 mask=mask,
                 cache=False, 
                 tokenizer=self.tokenizer,
+                train_dataset=train_dataset,
+                path_tokens=path_tokens,
                 banned_color=banned_color,
                 allowed_color=allowed_color
             )
             
             print(f"DEBUG: Grafo {output_file} salvato")
 
-    def _debug_visualize_first_user_with_hard_restrictions(self, hard_keys, soft_keys, pref_keys, train_dataset, hard_restriction_mask):
+    def _debug_visualize_first_user_with_hard_restrictions(self, hard_keys, soft_keys, pref_keys, train_dataset, hard_restriction_mask, path_tokens=None):
         """
         Genera e salva il grafo del primo utente mostrando in rosso i nodi bannati dalle hard restrictions.
         
@@ -736,7 +783,9 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
             output_file="debug_first_user_with_hard_restrictions",
             mask=hard_restriction_mask,
             tokenizer=self.tokenizer,
-            cache=False
+            cache=False,
+            train_dataset=train_dataset,
+            path_tokens=path_tokens
         )
         
         print(f"DEBUG: Grafo con hard restrictions salvato come debug_first_user_with_hard_restrictions.svg")
@@ -778,116 +827,57 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
 
         return subgraph
 
-# --- inizio funzioni graphviz
-
-    def add_edges(dot, node, edges, subgraph_nodes=None, added_edges=None):
-        """Aggiunge nodi e archi al grafo, filtrando archi verso nodi non presenti nel sottografo.
-        Per grafi non orientati, evita di aggiungere connessioni duplicate.
-        """
-        dot.node(str(node), label=str(node))
-        for relation, connected_nodes in edges.items():
-            for connected_node in connected_nodes:
-                # Disegna l'arco solo se il nodo connesso è nel sottografo
-                if subgraph_nodes is None or connected_node in subgraph_nodes:
-                    # Per grafi non orientati, evita duplicati (A-B è uguale a B-A)
-                    if added_edges is not None:
-                        edge_pair = tuple(sorted([node, connected_node]))
-                        if edge_pair in added_edges:
-                            continue
-                        added_edges.add(edge_pair)
-                    dot.edge(str(node), str(connected_node), label=str(relation))
-
-    def update_node_colors(dot, mask, tokenizer, subgraph_nodes=None, banned_color="", allowed_color=""):
-        """
-        Aggiorna i colori dei nodi nel grafo in base a una maschera booleana.
-
-        Se banned_color o allowed_color è una stringa vuota (o valore falsy), non
-        modifica il colore dei nodi di quel tipo.
-        
-        Args:
-            dot: Oggetto grafo Graphviz
-            mask: Maschera booleana
-            tokenizer: Tokenizer per convertire ID in token
-            subgraph_nodes: Set di nodi da includere (None = tutti)
-            banned_color: Colore per nodi bannati
-            allowed_color: Colore per nodi permessi
-        """
-        
-        for token_id, is_banned in enumerate(mask):
-            # Salta i nodi che non sono nel sottografo
-            if subgraph_nodes is not None and token_id not in subgraph_nodes:
-                continue
-                
-            node_name = str(tokenizer.convert_ids_to_tokens(token_id))
-            if is_banned:
-                if banned_color:  # se vuoto -> non toccare i nodi bannati
-                    dot.node(node_name, style="filled", fillcolor=banned_color)
-            else:
-                if allowed_color:  # se vuoto -> non toccare i nodi permessi
-                    dot.node(node_name, style="filled", fillcolor=allowed_color)
-
-    def convert_ckg_to_graphviz(tokenized_ckg, output_file="graph", mask=None, tokenizer=None, cache=True):
-        """
-        Converte il tokenized_ckg in un grafo stampabile con Graphviz, con supporto per caching, parallelizzazione e aggiornamento dei colori.
-
-        Args:
-            tokenized_ckg (dict): Dizionario che rappresenta il grafo.
-            output_file (str): Nome del file di output (senza estensione).
-            mask (np.ndarray): Maschera booleana (True = bannato, False = permesso).
-            tokenizer: Tokenizer per convertire gli ID dei token in stringhe.
-            cache (bool): Se True, usa il file di cache se esiste (disabilitato se mask è presente).
-
-        Returns:
-            graphviz.Digraph: Oggetto Graphviz del grafo.
-        """
-        # Disabilita la cache se c'è una maschera (perché la maschera cambia i colori)
-        use_cache = cache and mask is None
-        
-        # Calcola l'hash della struttura del grafo
-        ckg_str = str(tokenized_ckg).encode('utf-8')
-        graph_hash =  hashlib.md5(ckg_str).hexdigest()
-        cache_file = f"{output_file}_{graph_hash}.gv"
-
-        # Usa il file di cache per la struttura del grafo se esiste
-        if use_cache and os.path.exists(cache_file):
-            print(f"DEBUG: Usando la struttura del grafo in cache {cache_file}")
-            dot = graphviz.Source.from_file(cache_file)
-        else:
-            # Crea un nuovo grafo non orientato (senza frecce)
-            dot = graphviz.Graph(format="svg")
-
-            # Ottieni l'insieme dei nodi del sottografo per il filtro
-            subgraph_nodes = set(tokenized_ckg.keys())
-
-            # Set per tracciare le connessioni già aggiunte (per evitare duplicati)
-            added_edges = set()
-            
-            # Aggiungi nodi e archi (senza parallelizzazione per evitare race conditions sul set)
-            for node, edges in tokenized_ckg.items():
-                ConstrainedLogitsProcessorWordLevelDevel.add_edges(dot, node, edges, subgraph_nodes, added_edges)
-
-            # Salva la struttura del grafo in cache solo se non c'è la maschera
-            if use_cache:
-                dot.save(cache_file)
-                print(f"DEBUG: Struttura del grafo salvata in {cache_file}")
-
-        # Aggiorna i colori dei nodi in base alla maschera
-        if mask is not None and tokenizer is not None:
-            ConstrainedLogitsProcessorWordLevelDevel.update_node_colors(dot, mask, tokenizer, subgraph_nodes=subgraph_nodes, banned_color="red", allowed_color="lightgreen")
-
-        # Salva il grafo su file
-        try:
-            dot.render(output_file, cleanup=True)
-            print(f"DEBUG: Grafo salvato come {output_file}.svg")
-        except Exception as e:
-            print(f"DEBUG: Errore durante il rendering del grafo: {e}")
-
-        return dot
-
 
 # --- inizio funzioni igraph 
 
-    def add_edges_igraph(graph, node, edges, node_to_idx, subgraph_nodes=None, added_edges=None):
+    def generate_path_with_mask(model, input_ids, mask=None, paths_per_user=1, top_k=None, device=None):
+        """Genera percorsi usando model.generate; il parametro mask è ignorato (maschera extra non usata)."""
+        target_device = device or getattr(model, "device", None) or input_ids.device
+        input_tensor = input_ids.to(target_device)
+
+        outputs = model.generate(
+            {"input_ids": input_tensor},
+            paths_per_user=paths_per_user,
+            top_k=top_k,
+        )
+        return outputs.sequences if hasattr(outputs, "sequences") else outputs
+
+    def _extract_numeric_id(token_str):
+        numeric_part = token_str[1:] if token_str and len(token_str) > 1 else ""
+        if numeric_part.isdigit():
+            return int(numeric_part)
+        return None
+
+    def _format_relation_label(relation, tokenizer=None, relation_id_to_token=None):
+        """Restituisce una stringa leggibile per l'etichetta dell'arco."""
+        token_str = None
+        if tokenizer is not None:
+            try:
+                rel_id = int(relation)
+                token_str = tokenizer.convert_ids_to_tokens(rel_id)
+                if relation_id_to_token is not None:
+                    mapped_id = ConstrainedLogitsProcessorWordLevelDevel._extract_numeric_id(token_str)
+                    if mapped_id is not None and 0 <= mapped_id < len(relation_id_to_token):
+                        return str(relation_id_to_token[mapped_id])
+            except Exception:
+                token_str = None
+        return token_str if token_str is not None else str(relation)
+
+    def _format_node_label(node_id, tokenizer=None, entity_id_to_token=None):
+        """Restituisce un'etichetta nodo coerente con i token del dataset."""
+        token_str = None
+        if tokenizer is not None:
+            try:
+                token_str = tokenizer.convert_ids_to_tokens(int(node_id))
+                if entity_id_to_token is not None:
+                    mapped_id = ConstrainedLogitsProcessorWordLevelDevel._extract_numeric_id(token_str)
+                    if mapped_id is not None and 0 <= mapped_id < len(entity_id_to_token):
+                        return str(entity_id_to_token[mapped_id])
+            except Exception:
+                token_str = None
+        return token_str if token_str is not None else str(node_id)
+
+    def add_edges_igraph(graph, node, edges, node_to_idx, tokenizer=None, subgraph_nodes=None, added_edges=None, relation_id_to_token=None):
         """
         Aggiunge archi al grafo igraph, filtrando archi verso nodi non presenti nel sottografo.
         Per grafi non orientati, evita di aggiungere connessioni duplicate.
@@ -901,6 +891,9 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
             added_edges: Set di tuple (edge_pair, relation) già aggiunte
         """
         for relation, connected_nodes in edges.items():
+            relation_label = ConstrainedLogitsProcessorWordLevelDevel._format_relation_label(
+                relation, tokenizer, relation_id_to_token
+            )
             for connected_node in connected_nodes:
                 # Disegna l'arco solo se il nodo connesso è nel sottografo
                 if subgraph_nodes is None or connected_node in subgraph_nodes:
@@ -915,7 +908,14 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
                     # Aggiungi l'arco
                     src_idx = node_to_idx[node]
                     dst_idx = node_to_idx[connected_node]
-                    graph.add_edge(src_idx, dst_idx, label=str(relation))
+                    graph.add_edge(
+                        src_idx,
+                        dst_idx,
+                        label=relation_label,
+                        relation_id=str(relation),
+                        color="gray",
+                        width=1,
+                    )
 
     def update_node_colors_igraph(graph, mask, tokenizer, subgraph_nodes=None, banned_color=None, allowed_color=None):
         """
@@ -955,7 +955,59 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
                     if allowed_color is not None:
                         graph.vs[idx]["color"] = allowed_color
 
-    def convert_ckg_to_igraph(tokenized_ckg, output_file="graph", mask=None, tokenizer=None, cache=True, banned_color=None, allowed_color=None):
+    def _extract_path_edges_from_tokens(path_tokens, tokenizer=None):
+        edges = []
+        if path_tokens is None or tokenizer is None:
+            return edges
+        current_entity = None
+        current_relation = None
+        for tok in path_tokens:
+            try:
+                tok_id = int(tok)
+            except Exception:
+                continue
+            tok_str = tokenizer.convert_ids_to_tokens(tok_id)
+            if not tok_str:
+                continue
+            prefix = tok_str[0]
+            numeric = ConstrainedLogitsProcessorWordLevelDevel._extract_numeric_id(tok_str)
+            if prefix in (PathLanguageModelingTokenType.ENTITY.value[0], PathLanguageModelingTokenType.ITEM.value[0]):
+                if current_entity is None:
+                    current_entity = tok_id
+                else:
+                    if current_relation is not None:
+                        edges.append((current_entity, tok_id, current_relation))
+                    current_entity = tok_id
+                    current_relation = None
+            elif prefix == PathLanguageModelingTokenType.RELATION.value[0]:
+                current_relation = tok_id
+        return edges
+
+    def highlight_path_in_igraph(graph, path_edges):
+        if not path_edges:
+            return
+        vertex_name_to_idx = {v["name"]: i for i, v in enumerate(graph.vs)}
+        path_nodes = set()
+        edge_keys = set()
+        for src, dst, rel in path_edges:
+            path_nodes.add(str(src))
+            path_nodes.add(str(dst))
+            edge_pair = tuple(sorted([str(src), str(dst)]))
+            edge_keys.add((edge_pair, str(rel)))
+        for node_name in path_nodes:
+            if node_name in vertex_name_to_idx:
+                graph.vs[vertex_name_to_idx[node_name]]["color"] = "gold"
+        for e_idx, e in enumerate(graph.es):
+            edge_pair = tuple(sorted([
+                graph.vs[e.source]["name"],
+                graph.vs[e.target]["name"],
+            ]))
+            rel_attr = e["relation_id"] if "relation_id" in e.attributes() else None
+            if (edge_pair, str(rel_attr)) in edge_keys:
+                graph.es[e_idx]["color"] = "gold"
+                graph.es[e_idx]["width"] = 3
+
+    def convert_ckg_to_igraph(tokenized_ckg, output_file="graph", mask=None, tokenizer=None, cache=True, banned_color=None, allowed_color=None, train_dataset=None, path_tokens=None, path_edges=None):
         """
         Converte il tokenized_ckg in un grafo igraph.
         
@@ -967,12 +1019,14 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
             cache (bool): Se True, usa il file di cache se esiste.
             banned_color: Colore per nodi bannati (None = mantieni azzurro).
             allowed_color: Colore per nodi permessi (None = mantieni azzurro).
+            train_dataset: Dataset per mappare ID a nomi leggibili del KG.
         
         Returns:
             igraph.Graph: Oggetto igraph del grafo.
         """
-        # Disabilita la cache se c'è una maschera
-        use_cache = cache and mask is None
+        # Disabilita la cache se c'è una maschera o se servono etichette arricchite dal dataset
+        # (per evitare di riutilizzare pickle con etichette obsolete)
+        use_cache = cache and mask is None and train_dataset is None
         
         # Calcola l'hash della struttura del grafo
         ckg_str = str(tokenized_ckg).encode('utf-8')
@@ -994,11 +1048,20 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
             node_list = list(subgraph_nodes)
             node_to_idx = {node: idx for idx, node in enumerate(node_list)}
             g.add_vertices(len(node_list))
+
+            # Prepara mapping da ID a nomi leggibili
+            entity_id_to_token = None
+            relation_id_to_token = None
+            if train_dataset is not None:
+                entity_id_to_token = train_dataset.field2id_token.get('entity_id')
+                relation_id_to_token = train_dataset.field2id_token.get('relation_id')
             
             # Imposta i nomi dei vertici e colore di default
             for node, idx in node_to_idx.items():
                 g.vs[idx]["name"] = str(node)
-                g.vs[idx]["label"] = str(node)
+                g.vs[idx]["label"] = ConstrainedLogitsProcessorWordLevelDevel._format_node_label(
+                    node, tokenizer, entity_id_to_token
+                )
                 g.vs[idx]["color"] = "lightblue"  # Colore di default
             
             # Set per tracciare le connessioni già aggiunte
@@ -1007,7 +1070,7 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
             # Aggiungi gli archi
             for node, edges in tokenized_ckg.items():
                 ConstrainedLogitsProcessorWordLevelDevel.add_edges_igraph(
-                    g, node, edges, node_to_idx, subgraph_nodes, added_edges
+                    g, node, edges, node_to_idx, tokenizer, subgraph_nodes, added_edges, relation_id_to_token
                 )
             
             # Salva in cache se richiesto
@@ -1023,6 +1086,15 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
                 g, mask, tokenizer, subgraph_nodes=subgraph_nodes, 
                 banned_color=banned_color, allowed_color=allowed_color
             )
+
+        # Evidenzia il path se fornito
+        effective_path_edges = path_edges
+        if effective_path_edges is None and path_tokens is not None:
+            effective_path_edges = ConstrainedLogitsProcessorWordLevelDevel._extract_path_edges_from_tokens(
+                path_tokens, tokenizer
+            )
+        if effective_path_edges:
+            ConstrainedLogitsProcessorWordLevelDevel.highlight_path_in_igraph(g, effective_path_edges)
         
         # Salva il grafo come immagine
         try:
@@ -1068,12 +1140,16 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
             # Aggiungi colori se presenti
             if "color" in g.vs.attributes():
                 visual_style["vertex_color"] = g.vs["color"]
+            if "color" in g.es.attributes():
+                visual_style["edge_color"] = g.es["color"]
+            if "width" in g.es.attributes():
+                visual_style["edge_width"] = g.es["width"]
             
             # Salva come immagine
             output_path = f"{output_file}.png"
-            igraph.plot(g, output_path, **visual_style)
-            print(f"DEBUG: Grafo igraph salvato come {output_path}")
-            print(f"DEBUG: Nodi: {n_vertices}, Canvas: {canvas_size}x{canvas_size}")
+            #igraph.plot(g, output_path, **visual_style)
+            #print(f"DEBUG: Grafo igraph salvato come {output_path}")
+            #print(f"DEBUG: Nodi: {n_vertices}, Canvas: {canvas_size}x{canvas_size}")
 
 
             # Salva anche in GraphML per import in Gephi
