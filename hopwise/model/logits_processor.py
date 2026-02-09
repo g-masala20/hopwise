@@ -240,7 +240,6 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
     If task is link prediction (LP) logit processor forces last token to reachable ones
     """
 
-
     def __init__(
         self,
         tokenized_ckg,
@@ -270,8 +269,7 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
 
         train_dataset = self.train_dataset
         entity_mapping = train_dataset.field2token_id['entity_id']
-        #print("DEBUG: ConstrainedLogitsProcessorWordLevelDevel __call__ invoked AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAa")
-
+        
         #breakpoint()
         current_len = input_ids.shape[-1]
         has_bos_token = self.is_bos_token_in_input(input_ids)
@@ -294,8 +292,6 @@ class ConstrainedLogitsProcessorWordLevelDevel(ConstrainedLogitsProcessorWordLev
 
         def usertoken_tokenizer2id(_id):
             return int(self.tokenizer.convert_ids_to_tokens(_id)[1:])
-    
-        #user_feat = train_dataset.get_user_feature()   
 
         #breakpoint()
 

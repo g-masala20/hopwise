@@ -75,6 +75,7 @@ dependencies = [
   "scikit-learn",
   "rich",
   "cachetools",
+  "python-igraph>=1.0.0",
 ]
 
 [project.optional-dependencies]

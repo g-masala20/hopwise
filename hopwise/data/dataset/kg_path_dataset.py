@@ -2,6 +2,7 @@
 # @Author : Giacomo Medda
 # @Email  : giacomo.medda@unica.it
 
+import os
 import random
 import warnings
 from itertools import chain, zip_longest
@@ -304,12 +305,34 @@ class KnowledgePathDataset(KnowledgeBasedDataset):
             raise ValueError("The data should be prepared before generating the path dataset.")
 
         if self._path_dataset is None:
-            generated_paths = self.generate_user_paths()
+            path_string_path = os.path.join(
+                self.config["checkpoint_dir"],
+                f"{self.strategy}-"
+                f"MAX_PATHS_PER_USER={self.max_paths_per_user}-"
+                f"restrict_by_phase={self.restrict_by_phase}-"
+                f"temporal={self.temporal_causality}-"
+                f"collaborative={self.collaborative_path}-"
+                f"path_dataset.txt",
+            )
+            if os.path.exists(path_string_path):
+                self.logger.info(
+                    f"Path dataset already exists at {path_string_path}, loading it instead of generating it again."
+                )
+                with open(path_string_path) as f:
+                    self._path_dataset = f.read()
+            else:
+                self.logger.info(
+                    f"Path dataset does not exist at {path_string_path}, generating it from the knowledge graph."
+                )
+                generated_paths = self.generate_user_paths()
 
-            path_string = ""
-            for path in generated_paths:
-                path_string += self._format_path(path) + "\n"
-            self._path_dataset = path_string
+                path_string = ""
+                for path in generated_paths:
+                    path_string += self._format_path(path) + "\n"
+                self._path_dataset = path_string
+
+                with open(path_string_path, "w") as f:
+                    f.write(self._path_dataset)
 
     def generate_user_paths(self):
         """Generate paths from the knowledge graph.

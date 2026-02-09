@@ -1,0 +1,72 @@
+# General
+log_wandb: True
+wandb_project: PhaseAPI
+
+# Dataset
+dataset: hummus
+data_path: ../preprocessing/hummus_rec_data/no_members_attributes
+save_dataset: True
+save_dataloaders: True
+USER_ID_FIELD: member_id
+ITEM_ID_FIELD: recipe_id
+load_col:
+  inter: ['member_id', 'recipe_id', 'timestamp']
+  item: ['recipe_id', 'name']
+  # user: ['member_id', 'member_url']
+  link: ['recipe_id', 'entity_id']
+  kg: ['head_id', 'relation_id', 'tail_id']
+
+# Data processing
+user_inter_num_interval: '[5,inf)'
+item_inter_num_interval: '[5,inf)'
+entity_kg_num_interval: '[30,inf)'
+relation_kg_num_interval: '[1,inf)'
+kg_reverse_r: True
+path_hop_length: 3
+MAX_PATHS_PER_USER: 250
+path_sample_args:
+  collaborative_path: True
+  strategy: metapath
+  restrict_by_phase: True
+  parallel_max_workers: 0
+  MAX_RW_PATHS_PER_HOP: 1
+metapaths: [
+    [['recipe_id', 'hasIndicator', 'entity_id'], ['entity_id', 'hasIndicator_r', 'recipe_id']],
+    [['recipe_id', 'isCompatibleWith_r', 'entity_id'], ['entity_id', 'isCompatibleWith', 'recipe_id']],
+    [['recipe_id', 'hasPart', 'entity_id'], ['entity_id', 'hasPart_r', 'recipe_id']],
+]
+
+# Training
+epochs: 2
+train_batch_size: 2048
+learner: adam
+learning_rate: 0.001
+eval_step: 5
+stopping_step: 3
+enable_amp: True
+enable_scaler: True
+
+# Evaluation
+eval_batch_size: 64
+valid_metric: NDCG@10
+metrics: ["Recall", "NDCG", "Precision", "ShannonEntropy", "Novelty", "ItemCoverage"]
+eval_args:
+  split: {'RS': [0.7,0.1,0.2]}
+  group_by: user
+  order: TO
+  mode: full
+
+# Model
+embedding_size: 64
+num_heads: 4
+num_layers: 2
+sequence_postprocessor: BeamSearch
+
+# Path Generation
+path_generation_args:
+  paths_per_user: 10
+  num_beams: 15
+  num_beam_groups: 5
+  diversity_penalty: 0.2
+
+gpu_id: '1'
